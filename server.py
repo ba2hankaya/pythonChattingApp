@@ -14,10 +14,95 @@ from cryptography.hazmat.primitives import serialization, hashes
 host = '127.0.0.1'
 port = 4444
 
+client_list = []
+
+class Client:
+    def __init__(self, ipaddress, username, reader : asyncio.StreamReader, writer: asyncio.StreamWriter, room = '#00000000'):
+        self.ipaddress = ipaddress
+        self.room = room
+        self.username = username
+        self.reader = reader
+        self.writer = writer
+    def change_room(self, room):
+        self.room = room
+
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
     print(f"Connection from {addr}")
+    
+    try:
+        aes_key = await establish_secure_channel_and_get_aes_key(reader, writer)
+
+        print("Secure channel established.")
+
+        username = await start_authentication_sequence(reader, writer, aes_key)
+
+        global client_list
+        newclient = Client(addr, username, reader, writer)
+        client_list.append(newclient)
+
+        await asyncio.gather(
+            send_loop(newclient, aes_key),
+            receive_loop(newclient, aes_key)
+        )
+
+        writer.close()
+        await writer.wait_closed()
+    except Exception as e:
+        print(e)
+
+
+async def start_authentication_sequence(reader, writer, aes_key):
+
+    print("Starting authentication sequence.")
+
+    msg = "Enter username: "
+    secure_msg = construct_secure_message(aes_key, msg)
+    writer.write((secure_msg.to_json() + "\n").encode())
+    await writer.drain()
+
+    username = await receive_secure_message(reader, writer, aes_key)
+    username = username.strip()
+
+    msg = "Enter password: "
+    secure_msg = construct_secure_message(aes_key, msg)
+    writer.write((secure_msg.to_json() + "\n").encode())
+    await writer.drain()
+
+    password = await receive_secure_message(reader, writer, aes_key)
+    password = password.strip()
+    count = 1
+    while not (username == "usertest" and password == "password"):
+        msg = "Wrong Credentials, try agian.\nEnter username: "
+        secure_msg = construct_secure_message(aes_key, msg)
+        writer.write((secure_msg.to_json() + "\n").encode())
+        await writer.drain()
+
+        username = await receive_secure_message(reader, writer, aes_key)
+        username = username.strip()
+        
+        msg = "Enter password: "
+        secure_msg = construct_secure_message(aes_key, msg)
+        writer.write((secure_msg.to_json() + "\n").encode())
+        await writer.drain()
+
+        password = await receive_secure_message(reader, writer, aes_key)
+        password = password.strip()
+        count += 1
+        if count == 3:
+            raise Exception("Too many wrong attempts")
+    
+
+    msg = "Login successful."
+    secure_msg = construct_secure_message(aes_key, msg)
+    writer.write((secure_msg.to_json() + "\n").encode())
+    await writer.drain()
+
+    return username
+
+
+async def establish_secure_channel_and_get_aes_key(reader, writer):
 
     data = await reader.readline()
     msg = Message.from_json(data.decode())
@@ -53,78 +138,28 @@ async def handle_client(reader, writer):
     writer.write(json_str.encode())
     await writer.drain()
 
-    print("Secure channel established.")
-
-    print("Starting login sequence.")
-
-    msg = "Enter username: "
-    secure_msg = construct_secure_message(aes_key, msg)
-    writer.write((secure_msg.to_json() + "\n").encode())
-    await writer.drain()
-
-    username = await receive_secure_message(reader, writer, aes_key)
-    username = username.strip()
-    
-    msg = "Enter password: "
-    secure_msg = construct_secure_message(aes_key, msg)
-    writer.write((secure_msg.to_json() + "\n").encode())
-    await writer.drain()
-
-    password = await receive_secure_message(reader, writer, aes_key)
-    password = password.strip()
-
-    while not (username == "usertest" and password == "password"):
-        msg = "Wrong Credentials, try agian.\nEnter username: "
-        secure_msg = construct_secure_message(aes_key, msg)
-        writer.write((secure_msg.to_json() + "\n").encode())
-        await writer.drain()
-
-        username = await receive_secure_message(reader, writer, aes_key)
-        username = username.strip()
-        
-        msg = "Enter password: "
-        secure_msg = construct_secure_message(aes_key, msg)
-        writer.write((secure_msg.to_json() + "\n").encode())
-        await writer.drain()
-
-        password = await receive_secure_message(reader, writer, aes_key)
-        password = password.strip()
-    
-
-    msg = "Login successful."
-    secure_msg = construct_secure_message(aes_key, msg)
-    writer.write((secure_msg.to_json() + "\n").encode())
-    await writer.drain()
-
-    await asyncio.gather(
-        send_loop(writer, aes_key),
-        receive_loop(reader, writer, aes_key)
-    )
-
-    writer.close()
-    await writer.wait_closed()
+    return aes_key
 
 
-async def send_loop(writer, aes_key):
+async def send_loop(client:Client, aes_key):
     try:
         while True:
             msg = await asyncio.to_thread(input, "> ")
             secure_msg = construct_secure_message(aes_key, msg)
-            writer.write((secure_msg.to_json() + "\n").encode())
-            await writer.drain()
+            client.writer.write((secure_msg.to_json() + "\n").encode())
+            await client.writer.drain()
     except (ConnectionError, asyncio.CancelledError):
         print("Send loop ended.")
 
 
-async def receive_loop(reader, writer, aes_key, max_delay_sec=5):
+async def receive_loop(client:Client, aes_key, max_delay_sec=5):
     try:
         while True:
-            message = await receive_secure_message(reader, writer, aes_key, max_delay_sec)
+            message = await receive_secure_message(client.reader, client.writer, aes_key, max_delay_sec)
             message = message.strip()
             print(f"\n[Received] {message}")
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
         print("Receive loop ended.")
-
 
 async def receive_secure_message(reader: asyncio.StreamReader, writer : asyncio.StreamWriter, aes_key: bytes, max_delay_sec=5) -> str:
     data = await reader.readline()
