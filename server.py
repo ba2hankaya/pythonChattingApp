@@ -54,9 +54,51 @@ async def handle_client(reader, writer):
     await writer.drain()
 
     print("Secure channel established.")
+
+    print("Starting login sequence.")
+
+    msg = "Enter username: "
+    secure_msg = construct_secure_message(aes_key, msg)
+    writer.write((secure_msg.to_json() + "\n").encode())
+    await writer.drain()
+
+    username = await receive_secure_message(reader, writer, aes_key)
+    username = username.strip()
+    
+    msg = "Enter password: "
+    secure_msg = construct_secure_message(aes_key, msg)
+    writer.write((secure_msg.to_json() + "\n").encode())
+    await writer.drain()
+
+    password = await receive_secure_message(reader, writer, aes_key)
+    password = password.strip()
+
+    while not (username == "usertest" and password == "password"):
+        msg = "Wrong Credentials, try agian.\nEnter username: "
+        secure_msg = construct_secure_message(aes_key, msg)
+        writer.write((secure_msg.to_json() + "\n").encode())
+        await writer.drain()
+
+        username = await receive_secure_message(reader, writer, aes_key)
+        username = username.strip()
+        
+        msg = "Enter password: "
+        secure_msg = construct_secure_message(aes_key, msg)
+        writer.write((secure_msg.to_json() + "\n").encode())
+        await writer.drain()
+
+        password = await receive_secure_message(reader, writer, aes_key)
+        password = password.strip()
+    
+
+    msg = "Login successful."
+    secure_msg = construct_secure_message(aes_key, msg)
+    writer.write((secure_msg.to_json() + "\n").encode())
+    await writer.drain()
+
     await asyncio.gather(
         send_loop(writer, aes_key),
-        receive_loop(reader, aes_key)
+        receive_loop(reader, writer, aes_key)
     )
 
     writer.close()
@@ -74,16 +116,17 @@ async def send_loop(writer, aes_key):
         print("Send loop ended.")
 
 
-async def receive_loop(reader, aes_key, max_delay_sec=5):
+async def receive_loop(reader, writer, aes_key, max_delay_sec=5):
     try:
         while True:
-            message = await receive_secure_message(reader, aes_key, max_delay_sec)
+            message = await receive_secure_message(reader, writer, aes_key, max_delay_sec)
+            message = message.strip()
             print(f"\n[Received] {message}")
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
         print("Receive loop ended.")
 
 
-async def receive_secure_message(reader: asyncio.StreamReader, aes_key: bytes, max_delay_sec=5) -> str:
+async def receive_secure_message(reader: asyncio.StreamReader, writer : asyncio.StreamWriter, aes_key: bytes, max_delay_sec=5) -> str:
     data = await reader.readline()
     if not data:
         raise ConnectionError("Connection closed by peer.")
@@ -91,6 +134,9 @@ async def receive_secure_message(reader: asyncio.StreamReader, aes_key: bytes, m
     msg = Message.from_json(data.decode())
 
     nonce = base64.b64decode(msg.nonce)
+
+    logNonce(nonce, writer)
+
     ciphertext = base64.b64decode(msg.payload["ciphertext"])
     tag = base64.b64decode(msg.payload["tag"])
     timestamp = msg.timestamp
@@ -153,14 +199,12 @@ def construct_secure_message(aes_key: bytes, plaintext: str) -> Message:
 
     return msg
 
-import time
-import asyncio
 
-NONCE_AWAIT_TIME = 30  # or whatever your nonce window is
+NONCE_AWAIT_TIME = 30 # or whatever your nonce window is
 
-def logNonce(nonce: str, writer: asyncio.StreamWriter):
+def logNonce(nonce: str, writer: asyncio.StreamWriter): #maybe make this in memory
     try:
-        with open("log.txt", "r") as f:
+        with open("nonces.txt", "r") as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
         lines = []
@@ -182,7 +226,7 @@ def logNonce(nonce: str, writer: asyncio.StreamWriter):
 
     new_lines.append(f"{nonce} {current_time}")
 
-    with open("log.txt", "w") as f:
+    with open("nonces.txt", "w") as f:
         for line in new_lines:
             f.write(f"{line}\n")
 
