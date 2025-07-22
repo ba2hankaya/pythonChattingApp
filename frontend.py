@@ -17,6 +17,15 @@ async def main():
         await server.serve_forever()
 
 async def handle_comms(reader, writer):
+    serverip = input("Enter server ip: ")
+    port = input("Enter server port: ")
+
+    writer.write((serverip + '\n').encode())
+    await writer.drain()
+
+    writer.write((port + '\n').encode())
+    await writer.drain()
+
     await asyncio.gather(
             receive_loop(reader),
             send_loop(writer)
@@ -29,7 +38,7 @@ async def receive_loop(backendreader):
             if not data:
                 print("backend disc")
                 sys.exit()
-            message = data.decode()
+            message = data.decode().strip()
             print(f"received from backend: {message}")
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
         print("connection to backend was lost while receiveing")
@@ -37,7 +46,7 @@ async def receive_loop(backendreader):
 async def send_loop(backendwriter):
     try:
         while True:
-            userinput = await asyncio.to_thread(input, "message: ")
+            userinput = await asyncio.to_thread(input, "> ")
             backendwriter.write((userinput + '\n').encode())
             await backendwriter.drain()
     except(ConnectionError, asyncio.CancelledError):
