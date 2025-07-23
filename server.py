@@ -15,16 +15,81 @@ host = '127.0.0.1'
 port = 4444
 
 client_list = []
+rooms = []
+
+MAIN_MENU_CODE = '#00000000'
 
 class Client:
-    def __init__(self, ipaddress, username, reader : asyncio.StreamReader, writer: asyncio.StreamWriter, room = '#00000000'):
+    def __init__(self, ipaddress, username, reader : asyncio.StreamReader, writer: asyncio.StreamWriter, aes_key, roomcode = MAIN_MENU_CODE):
         self.ipaddress = ipaddress
-        self.room = room
+        self.roomcode = roomcode
         self.username = username
         self.reader = reader
         self.writer = writer
-    def change_room(self, room):
-        self.room = room
+        self.aes_key = aes_key
+    async def send_secure_message(self, message):
+        secure_msg = construct_secure_message(self.aes_key, message)
+        self.writer.write((secure_msg.to_json() + "\n").encode())
+        await self.writer.drain()
+    async def receive_secure_message(self):
+        message = await receive_secure_message_and_log(self.reader, self.writer, self.aes_key)
+        message = message.strip()
+        return message
+    async def join(self, room: 'Room'):
+        if room.has_password():
+            message = "Enter password for this room: "
+            await self.send_secure_message(message)
+            received_password = await self.receive_secure_message()
+            if room.try_password(received_password):
+                self.roomcode = room.code
+                message = "You have succesfully entered the room."
+                await self.send_secure_message(message)
+            else:
+                message = "Wrong password."
+                await self.send_secure_message(message)
+        else:
+            self.roomcode = room.code
+            message = "You have succesfully entered the room."
+            await self.send_secure_message(message)
+
+
+class Room:
+    def __init__(self, owner:Client, code):
+        self.owner = owner 
+        self.code = code
+        self.password = None
+    async def set_password(self, attemptor:Client):
+        if attemptor == self.owner:
+            if self.has_password():
+                message = "Enter current password: "
+                await attemptor.send_secure_message(message)
+                received_password = await attemptor.receive_secure_message()
+                if self.password == received_password:
+                    message = "Enter new password: "
+                    await attemptor.send_secure_message(message)
+                    received_password = await attemptor.receive_secure_message()
+                    self.password = received_password
+                    message = "Password change successful"
+                    await attemptor.send_secure_message(message)
+                else:
+                    message = "Wrong password. To try again, run the command again."
+                    await attemptor.send_secure_message(message)
+            else:
+                message = "Enter new password: "
+                await attemptor.send_secure_message(message)
+                received_password = await attemptor.receive_secure_message()
+                self.password = received_password
+                message = "Password was set successfully"
+                await attemptor.send_secure_message(message)
+        else:
+            message = "You don't have the authority to do that in this room."
+            await attemptor.send_secure_message(message)
+    def has_password(self):
+        if not self.password:
+            return False
+        return True
+    def try_password(self, password):
+        return password == self.password
 
 
 async def handle_client(reader, writer):
@@ -38,13 +103,12 @@ async def handle_client(reader, writer):
 
         username = await start_authentication_sequence(reader, writer, aes_key)
 
-        global client_list
-        newclient = Client(addr, username, reader, writer)
+        newclient = Client(addr, username, reader, writer, aes_key)
         client_list.append(newclient)
 
         await asyncio.gather(
-            send_loop(newclient, aes_key),
-            receive_loop(newclient, aes_key)
+            send_loop(newclient),
+            receive_loop(newclient)
         )
 
         writer.close()
@@ -141,27 +205,73 @@ async def establish_secure_channel_and_get_aes_key(reader, writer):
     return aes_key
 
 
-async def send_loop(client:Client, aes_key):
+async def send_loop(client:Client):
     try:
         while True:
             msg = await asyncio.to_thread(input, "> ")
-            secure_msg = construct_secure_message(aes_key, msg)
-            client.writer.write((secure_msg.to_json() + "\n").encode())
-            await client.writer.drain()
+            await client.send_secure_message(msg)
     except (ConnectionError, asyncio.CancelledError):
         print("Send loop ended.")
 
 
-async def receive_loop(client:Client, aes_key, max_delay_sec=5):
+async def receive_loop(client:Client, max_delay_sec=5):
     try:
         while True:
-            message = await receive_secure_message(client.reader, client.writer, aes_key, max_delay_sec)
-            message = message.strip()
+            message = await client.receive_secure_message()
             print(f"\n[Received] {message}")
     except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
         print("Receive loop ended.")
 
-async def receive_secure_message(reader: asyncio.StreamReader, writer : asyncio.StreamWriter, aes_key: bytes, max_delay_sec=5) -> str:
+async def list_rooms(client:Client):
+    message = ""
+    for room in rooms:
+        message += f"{room.code}\n"
+    await client.send_secure_message(message)
+
+async def send_help_message(client:Client):
+    message = """To list the rooms already present use \'list\' command.\n
+    To join a room, use \'join #{room_num}\', (if the room has a password, you will have to provide one).\n
+    If you wish to create a room, join a non-existing room and after entering use setpasswd command to put a password to it if you wish.\n
+    To exit the room you are in and return to main menu, use the \'exitroom\' command\n
+    To receive this help message use the \'help\' command."""
+    await client.send_secure_message(message)
+
+async def exit_room(client:Client):
+    client.roomcode = MAIN_MENU_CODE
+    message = "You are in the main menu now."
+    await client.send_secure_message(message)
+
+async def join_room(client:Client, room_code):
+    for room in rooms:
+        if room_code == room.code:
+            await client.join(room)
+            return
+    r = Room(client, room_code)
+    rooms.append(r)
+    message = f"You are the owner of the room {room_code}"
+    await client.send_secure_message(message)
+
+async def set_room_password(client:Client):
+    if client.roomcode == MAIN_MENU_CODE:
+        message = "You can't do that in the main menu."
+        await client.send_secure_message(message)
+    else:
+        for room in rooms:
+            if client.roomcode == room.code:
+                r = room
+                break
+        await r.set_password(client)
+        
+
+commands = {
+    "list":list_rooms,
+    "help":send_help_message,
+    "join":join_room,
+    "setpasswd":set_room_password,
+    "exitroom":exit_room
+}
+
+async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : asyncio.StreamWriter, aes_key: bytes, max_delay_sec=5) -> str:
     data = await reader.readline()
     if not data:
         raise ConnectionError("Connection closed by peer.")
