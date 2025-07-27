@@ -20,13 +20,14 @@ rooms = []
 MAIN_MENU_CODE = '#00000000'
 
 class Client:
-    def __init__(self, ipaddress, username, reader : asyncio.StreamReader, writer: asyncio.StreamWriter, aes_key, roomcode = MAIN_MENU_CODE):
+    def __init__(self, ipaddress, username, reader : asyncio.StreamReader, writer: asyncio.StreamWriter, aes_key):
         self.ipaddress = ipaddress
-        self.roomcode = roomcode
         self.username = username
         self.reader = reader
         self.writer = writer
         self.aes_key = aes_key
+        self.owned_rooms_count = 0
+        self.curroom = None
     async def send_secure_message(self, message):
         secure_msg = construct_secure_message(self.aes_key, message)
         self.writer.write((secure_msg.to_json() + "\n").encode())
@@ -41,14 +42,20 @@ class Client:
             await self.send_secure_message(message)
             received_password = await self.receive_secure_message()
             if room.try_password(received_password):
-                self.roomcode = room.code
-                message = "You have succesfully entered the room."
+                self.curroom.members.remove(self)
+                room.add_member(self)
+                self.owned_rooms_count += 1
+                message = f"You have succesfully entered the room {room.code}."
+                self.curroom = room
                 await self.send_secure_message(message)
             else:
                 message = "Wrong password."
                 await self.send_secure_message(message)
         else:
-            self.roomcode = room.code
+            room.add_member(self)
+            if self.curroom:
+                self.curroom.members.remove(self)
+            self.curroom = room
             message = "You have succesfully entered the room."
             await self.send_secure_message(message)
 
@@ -58,6 +65,7 @@ class Room:
         self.owner = owner 
         self.code = code
         self.password = None
+        self.members = []
     async def set_password(self, attemptor:Client):
         if attemptor == self.owner:
             if self.has_password():
@@ -90,7 +98,8 @@ class Room:
         return True
     def try_password(self, password):
         return password == self.password
-
+    def add_member(self, client:Client):
+        self.members.append(client)
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
@@ -106,6 +115,8 @@ async def handle_client(reader, writer):
         newclient = Client(addr, username, reader, writer, aes_key)
         client_list.append(newclient)
 
+        await newclient.join(rooms[0])
+
         await asyncio.gather(
             send_loop(newclient),
             receive_loop(newclient)
@@ -115,6 +126,11 @@ async def handle_client(reader, writer):
         await writer.wait_closed()
     except Exception as e:
         print(e)
+    finally:
+        if newclient in client_list:
+            client_list.remove(newclient)
+        writer.close()
+        await writer.wait_closed()
 
 
 async def start_authentication_sequence(reader, writer, aes_key):
@@ -126,7 +142,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
     writer.write((secure_msg.to_json() + "\n").encode())
     await writer.drain()
 
-    username = await receive_secure_message(reader, writer, aes_key)
+    username = await receive_secure_message_and_log(reader, writer, aes_key)
     username = username.strip()
 
     msg = "Enter password: "
@@ -134,7 +150,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
     writer.write((secure_msg.to_json() + "\n").encode())
     await writer.drain()
 
-    password = await receive_secure_message(reader, writer, aes_key)
+    password = await receive_secure_message_and_log(reader, writer, aes_key)
     password = password.strip()
     count = 1
     while not (username == "usertest" and password == "password"):
@@ -143,7 +159,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
         writer.write((secure_msg.to_json() + "\n").encode())
         await writer.drain()
 
-        username = await receive_secure_message(reader, writer, aes_key)
+        username = await receive_secure_message_and_log(reader, writer, aes_key)
         username = username.strip()
         
         msg = "Enter password: "
@@ -151,7 +167,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
         writer.write((secure_msg.to_json() + "\n").encode())
         await writer.drain()
 
-        password = await receive_secure_message(reader, writer, aes_key)
+        password = await receive_secure_message_and_log(reader, writer, aes_key)
         password = password.strip()
         count += 1
         if count == 3:
@@ -210,8 +226,8 @@ async def send_loop(client:Client):
         while True:
             msg = await asyncio.to_thread(input, "> ")
             await client.send_secure_message(msg)
-    except (ConnectionError, asyncio.CancelledError):
-        print("Send loop ended.")
+    except (ConnectionError, asyncio.CancelledError) as e:
+        raise Exception(f"send loop ended for client {client.username}: {e}")
 
 
 async def receive_loop(client:Client, max_delay_sec=5):
@@ -219,8 +235,41 @@ async def receive_loop(client:Client, max_delay_sec=5):
         while True:
             message = await client.receive_secure_message()
             print(f"\n[Received] {message}")
-    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
-        print("Receive loop ended.")
+            if message.startswith('/'):
+                await handle_command(client,message)
+            else:
+                if not client.curroom.code == MAIN_MENU_CODE:
+                    for cl in client.curroom.members:
+                        await cl.send_secure_message(message)
+                else:
+                    message = "you can't message in the main menu, type /help for help"
+                    await client.send_secure_message(message)
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError) as e:
+        raise Exception(f"receive loop ended for client {client.username}: {e}")
+
+async def handle_command(client: Client, message: str):
+    parts = message[1:].strip().split()
+    if not parts:
+        await client.send_secure_message("invalid command. /help for help")
+        return
+
+    cmd = parts[0].lower()
+    args = parts[1:]
+
+    if cmd in commands:
+        try:
+            if cmd == "join":
+                if not args:
+                    await client.send_secure_message("invalid command. /help for help")
+                    return
+                await commands[cmd](client, args[0])
+            else:
+                await commands[cmd](client)
+        except Exception as e:
+            print(f"Error executing command {cmd}, {e}")
+    else:
+        await client.send_secure_message("invalid command. /help for help")
+
 
 async def list_rooms(client:Client):
     message = ""
@@ -237,27 +286,37 @@ async def send_help_message(client:Client):
     await client.send_secure_message(message)
 
 async def exit_room(client:Client):
-    client.roomcode = MAIN_MENU_CODE
+    await client.join(rooms[0])
     message = "You are in the main menu now."
     await client.send_secure_message(message)
 
 async def join_room(client:Client, room_code):
+    if not room_code.startswith('#') or len(room_code) != 9:
+        await client.send_secure_message("Room code must be in format '#12345678'")
+        return
+
     for room in rooms:
         if room_code == room.code:
             await client.join(room)
             return
-    r = Room(client, room_code)
-    rooms.append(r)
-    message = f"You are the owner of the room {room_code}"
-    await client.send_secure_message(message)
+    if client.owned_rooms_count < 3:
+        r = Room(client, room_code)
+        rooms.append(r)
+        client.owned_rooms_count += 1
+        message = f"You are the owner of the room {room_code}"
+        await client.send_secure_message(message)
+        await client.join(r)
+    else:
+        message = f"You already own 3 rooms, you can't create more."
+        await client.send_secure_message(message)
 
 async def set_room_password(client:Client):
-    if client.roomcode == MAIN_MENU_CODE:
+    if client in rooms[0].members:
         message = "You can't do that in the main menu."
         await client.send_secure_message(message)
     else:
         for room in rooms:
-            if client.roomcode == room.code:
+            if client in room.members:
                 r = room
                 break
         await r.set_password(client)
@@ -378,6 +437,9 @@ def logNonce(nonce: str, writer: asyncio.StreamWriter): #maybe make this in memo
 
 
 async def main():
+    main_menu = Room(None, MAIN_MENU_CODE)
+    rooms.append(main_menu)
+
     server = await asyncio.start_server(handle_client, host, port)
     print(f"Server listening on {host}:{port}")
     async with server:
