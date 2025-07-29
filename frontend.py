@@ -30,7 +30,7 @@ class NonBlockingInput:
             await send_msg(self.backendwriter, self.s)
             self.s = ""
         elif key in (curses.KEY_BACKSPACE, 127):
-            if(len(self.s) > 0):
+            if len(self.s) > 0:
                 self.s = self.s[:-1]
         elif 32 <= key <= 126:
             self.s += str(chr(key))
@@ -108,6 +108,8 @@ async def handle_comms(reader, writer):
         print(e)
     finally:
         curses.endwin()
+        writer.close()
+        await writer.wait_closed()
 
 async def receive_loop(backendreader, receivewin):
     try:
@@ -120,15 +122,15 @@ async def receive_loop(backendreader, receivewin):
             message = data.decode().strip()
             outrecv.add_message(message)
             #print(f"received from backend: {message}")
-    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
-        print("connection to backend was lost while receiveing")
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError) as e:
+        raise Exception(f"connection to backend was lost while during receive loop. Error:{e}")
 
 async def send_msg(backendwriter, msg):
     try:
         backendwriter.write((msg + '\n').encode())
         await backendwriter.drain()
-    except Exception as e:
-        print(e)
+    except (ConnectionError, asyncio.CancelledErroras) as e:
+        raise Exception(f"connection to back end was lost during send loop. Error:{e}")
 
 
 async def send_loop(inputwin, backendwriter):
@@ -140,8 +142,8 @@ async def send_loop(inputwin, backendwriter):
             #userinput = await asyncio.to_thread(input, "> ")
             #backendwriter.write((userinput + '\n').encode())
             #await backendwriter.drain()
-    except(ConnectionError, asyncio.CancelledError):
-        print("connection to backend was lost while sending")
+    except Exception as e:
+        raise Exception(f"connection to backend was lost while sending. Error:{e}")
 
 
 asyncio.run(main())
