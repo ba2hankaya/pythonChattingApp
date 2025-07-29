@@ -36,29 +36,46 @@ class Client:
         message = await receive_secure_message_and_log(self.reader, self.writer, self.aes_key)
         message = message.strip()
         return message
+    def switch_room(self, room):
+        assert self.current_room
+        assert self in self.current_room.members
+        if room == self.current_room:
+            return
+        self.current_room.members.remove(self)
+        self.current_room = room
+        room.add_member(self)
     async def join(self, room: 'Room'):
-        if not room.has_banned(self.username):
-            if room.has_password():
-                message = f"Server: Enter password for this room ({room.code}): "
-                await self.send_secure_message(message)
-                received_password = await self.receive_secure_message()
-                if room.try_password(received_password):
-                    self.current_room.members.remove(self)
-                    room.add_member(self)
-                    self.owned_rooms_count += 1
-                    message = f"Server: You have successfully entered the room {room.code}."
-                    self.current_room = room
-                    await self.send_secure_message(message)
-                else:
-                    message = "Server: Wrong password."
-                    await self.send_secure_message(message)
-            else:
-                room.add_member(self)
-                if self.current_room:
-                    self.current_room.members.remove(self)
-                self.current_room = room
+        if room.has_banned_user_with_username(self.username):
+            message = f"Server : You are banned from {room.code}. Unless the owner unbans you, you can't join."
+            await self.send_secure_message(message)
+            return
+        if room.has_password():
+            message = f"Server: Enter password for this room ({room.code}): "
+            await self.send_secure_message(message)
+            received_password = await self.receive_secure_message()
+            if room.is_correct_password(received_password):
+                self.switch_room(room)
                 message = f"Server: You have successfully entered the room {room.code}."
                 await self.send_secure_message(message)
+            else:
+                message = "Server: Wrong password."
+                await self.send_secure_message(message)
+        else:
+            self.switch_room(room)
+            message = f"Server: You have successfully entered the room {room.code}."
+            await self.send_secure_message(message)
+    async def create_room(self, room_code:str):
+        for room in rooms:
+            assert(room.code != room_code)
+        r = Room(self, room_code)
+        self.owned_rooms_count += 1
+        message = f"Server: Room {room_code} has been created and is now owned by you."
+        await self.send_secure_message(message)
+        await self.join(r)
+    async def prompt_and_get_response(self, message):
+        await self.send_secure_message(message)
+        return await self.receive_secure_message()
+
 
 
 class Room:
@@ -69,36 +86,37 @@ class Room:
         self.members = []
         self.banned_members = []
     async def set_password(self, attempter:Client):
-        if attempter == self.owner:
-            if self.has_password():
-                message = "Server: Enter current password"
-                await attempter.send_secure_message(message)
-                received_password = await attempter.receive_secure_message()
-                if self.password == received_password:
-                    message = "Server: Enter new password"
-                    await attempter.send_secure_message(message)
-                    received_password = await attempter.receive_secure_message()
-                    self.password = received_password
-                    message = "Server: Password change successful"
-                    await attempter.send_secure_message(message)
-                else:
-                    message = "Server: Wrong password. To try again, run the command again."
-                    await attempter.send_secure_message(message)
-            else:
-                message = "Server: Enter new password"
-                await attempter.send_secure_message(message)
-                received_password = await attempter.receive_secure_message()
-                self.password = received_password
-                message = "Server: Password was set successfully"
-                await attempter.send_secure_message(message)
-        else:
+        if attempter != self.owner:
             message = "Server: You don't have the authority to do that in this room."
             await attempter.send_secure_message(message)
+            return
+        if self.has_password():
+            message = "Server: Enter current password"
+            received_password_old = attempter.prompt_and_get_response(message)
+            if self.password != received_password_old:
+                message = "Server: Wrong password. To try again, run the command again."
+                await attempter.send_secure_message(message)
+                return
+            message = "Server: Enter new password"
+            received_password_new = attempter.prompt_and_get_response(message)
+            if self.password == received_password_old:
+                message = "Server: New password cannot be the same as old password."
+                await attempter.send_secure_message(message)
+                return
+            self.password = received_password_new
+            message = "Server: Password change successful"
+            await attempter.send_secure_message(message)
+        else:
+            message = "Server: Enter new password"
+            received_password = attempter.prompt_and_get_response(message)
+            self.password = received_password
+            message = "Server: Password was set successfully"
+            await attempter.send_secure_message(message)
+
     def has_password(self):
-        if not self.password:
-            return False
-        return True
-    def try_password(self, password):
+        return self.password is not None
+
+    def is_correct_password(self, password):
         return password == self.password
     def add_member(self, client:Client):
         self.members.append(client)
@@ -112,15 +130,13 @@ class Room:
                 await cl.send_secure_message(message)
                 await exit_room(cl)
                 break
-    def has_banned(self, client:Client):
-        if client.username in self.banned_members:
-            return True
-        return False
+    def has_banned_user_with_username(self, username:str):
+        return username in self.banned_members
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
     print(f"Connection from {addr}")
-    
+    new_client = None
     try:
         aes_key = await establish_secure_channel_and_get_aes_key(reader, writer)
 
@@ -273,21 +289,20 @@ async def handle_command(client: Client, message: str):
 
     cmd = parts[0].lower()
     args = parts[1:]
-
-    if cmd in commands:
-        try:
-            if cmd == "join" or cmd == "kick" or cmd == "ban":
-                if not args:
-                    await client.send_secure_message("Server: Invalid command. /help for help")
-                    return
-                await commands[cmd](client, args[0])
-            else:
-                await commands[cmd](client)
-        except Exception as e:
-            print(f"Error executing command {cmd}, {e}")
-    else:
+    if cmd not in commands:
         await client.send_secure_message("Server: Invalid command. /help for help")
+        return
+    try:
+        func, min_arg_count = commands[cmd]
+        if len(args) < min_arg_count:
+            await client.send_secure_message("Server: Invalid use of the command. /help for help")
+            return
+        await func(client, *args[:min_arg_count])
+    except Exception as e:
+        raise Exception(f"Error executing command {cmd}, {e}")
 
+
+#Commands start here
 
 async def list_rooms(client:Client):
     message = ""
@@ -308,6 +323,7 @@ async def exit_room(client:Client):
     message = "Server: You are in the main menu now."
     await client.send_secure_message(message)
 
+MAX_ROOMS_PER_CLIENT = 3
 async def join_room(client:Client, room_code):
     if not room_code.startswith('#') or len(room_code) != 9 or not room_code[1:].isalnum():
         await client.send_secure_message("Server: Room code must be in format '#12345678' and alphanumeric.")
@@ -317,15 +333,10 @@ async def join_room(client:Client, room_code):
         if room_code == room.code:
             await client.join(room)
             return
-    if client.owned_rooms_count < 3:
-        r = Room(client, room_code)
-        rooms.append(r)
-        client.owned_rooms_count += 1
-        message = f"Server: You are the owner of the room {room_code}"
-        await client.send_secure_message(message)
-        await client.join(r)
+    if client.owned_rooms_count < MAX_ROOMS_PER_CLIENT:
+        await client.create_room(room_code)
     else:
-        message = f"Server: You already own 3 rooms, you can't create more."
+        message = f"Server: You already own {MAX_ROOMS_PER_CLIENT} rooms, you can't create more."
         await client.send_secure_message(message)
 
 async def set_room_password(client:Client):
@@ -341,10 +352,11 @@ async def kick_all(client:Client):
     if r.owner != client.username:
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
-    else:
-        for cl in client.current_room.members:
-            if cl != client:
-                await kick(client, cl.username)
+        return
+
+    for cl in client.current_room.members:
+        if cl != client:
+            await kick(client, cl.username)
 
 
 async def kick(client:Client, to_be_kicked:str):
@@ -352,31 +364,38 @@ async def kick(client:Client, to_be_kicked:str):
     if r.owner != client.username:
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
-    else:
-        for cl in r.members:
-            if cl.username == to_be_kicked:
-                message = f"Server: You have been kicked by {client.username}"
-                await exit_room(cl)
-                await cl.send_secure_message(message)
+        return
+    if to_be_kicked == client.username:
+        message = f"Server: You can't kick yourself. You can use the \'/exitroom\' command to exit the room."
+        await client.send_secure_message(message)
+        return
+    for cl in r.members:
+        if cl.username == to_be_kicked:
+            message = f"Server: You have been kicked by {client.username}"
+            await exit_room(cl)
+            await cl.send_secure_message(message)
 
 async def ban(client:Client, to_ban_username:str):
     r = client.current_room
-    if client.username != to_ban_username:
-        r.ban(to_ban_username)
-    else:
+    if client.username == to_ban_username:
         message = f"Server: You can't ban yourself"
         await client.send_secure_message(message)
+        return
+    r.ban(to_ban_username)
 
 commands = {
-    "list":list_rooms,
-    "help":send_help_message,
-    "join":join_room,
-    "setpasswd":set_room_password,
-    "exitroom":exit_room,
-    "kickall":kick_all,
-    "kick":kick,
-    "ban":ban
+    #f"{command_name}:(func_name, num_of_args)
+    "list":(list_rooms, 0),
+    "help":(send_help_message, 0),
+    "join":(join_room, 1),
+    "setpasswd":(set_room_password, 0),
+    "exitroom":(exit_room, 0),
+    "kickall":(kick_all, 0),
+    "kick":(kick, 1),
+    "ban":(ban, 1)
 }
+
+#Commands end here
 
 async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : asyncio.StreamWriter, aes_key: bytes, max_delay_sec=5) -> str:
     data = await reader.readline()
@@ -454,7 +473,7 @@ def construct_secure_message(aes_key: bytes, plaintext: str) -> Message:
 
 NONCE_AWAIT_TIME = 30 # or whatever your nonce window is
 
-def log_nonce(nonce: str, writer: asyncio.StreamWriter): #maybe make this in memory
+def log_nonce(nonce: bytes, writer: asyncio.StreamWriter): #maybe make this in memory
     try:
         with open("nonces.txt", "r") as f:
             lines = f.read().splitlines()
@@ -473,10 +492,10 @@ def log_nonce(nonce: str, writer: asyncio.StreamWriter): #maybe make this in mem
 
         if current_time - timestamp < NONCE_AWAIT_TIME:
             new_lines.append(f"{prev_nonce} {timestamp}")
-            if prev_nonce == nonce:
+            if prev_nonce == nonce.decode():
                 raise ValueError(f"Replay attack detected from {writer.get_extra_info('peername')} with nonce: {nonce}")
 
-    new_lines.append(f"{nonce} {current_time}")
+    new_lines.append(f"{nonce.decode()} {current_time}")
 
     with open("nonces.txt", "w") as f:
         for line in new_lines:
