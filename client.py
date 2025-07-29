@@ -34,56 +34,59 @@ async def main():
 
 
 async def connect_with_server(ipaddr , port, ctx:ClientContext):
-    ctx.backendreader, ctx.backendwriter = await asyncio.open_connection(ipaddr, port)
+    try:
+        ctx.backendreader, ctx.backendwriter = await asyncio.open_connection(ipaddr, port)
 
-    # Generate RSA key pair
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_key = private_key.public_key()
+        # Generate RSA key pair
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        public_key = private_key.public_key()
 
-    # Send public key
-    pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode()
+        # Send public key
+        pem = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode()
 
-    msg = Message(
-        type="key_exchange",
-        payload={"rsa_public_key": pem}
-    )
-
-    json_str = msg.to_json() + '\n'
-    ctx.backendwriter.write(json_str.encode())
-    await ctx.backendwriter.drain()
-    print("Sent public key")
-
-    # Receive AES key from server
-    data = await ctx.backendreader.readline()
-    msg = Message.from_json(data.decode())
-
-    if msg.type != "aes_key":
-        print("Did not receive AES key")
-        sys.exit()
-
-    encrypted_key_str = msg.payload["encrypted_aes_key"]
-    encrypted_aes_key = base64.b64decode(encrypted_key_str)
-
-    ctx.aes_key = private_key.decrypt(
-        encrypted_aes_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
+        msg = Message(
+            type="key_exchange",
+            payload={"rsa_public_key": pem}
         )
-    )
 
-    print("Secure channel established")
-    await asyncio.gather(
-        front_end_receive_loop(ctx),
-        receive_loop(ctx)
-    )
+        json_str = msg.to_json() + '\n'
+        ctx.backendwriter.write(json_str.encode())
+        await ctx.backendwriter.drain()
+        print("Sent public key")
 
-    ctx.backendwriter.close()
-    await ctx.backendwriter.wait_closed()
+        # Receive AES key from server
+        data = await ctx.backendreader.readline()
+        msg = Message.from_json(data.decode())
+
+        if msg.type != "aes_key":
+            raise Exception("Did not receive AES key")
+
+        encrypted_key_str = msg.payload["encrypted_aes_key"]
+        encrypted_aes_key = base64.b64decode(encrypted_key_str)
+
+        ctx.aes_key = private_key.decrypt(
+            encrypted_aes_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+
+        print("Secure channel established")
+        await asyncio.gather(
+            front_end_receive_loop(ctx),
+            receive_loop(ctx)
+        )
+
+    except Exception as e:
+        print(e)
+    finally:
+        ctx.backendwriter.close()
+        await ctx.backendwriter.wait_closed()
 
 async def receive_loop(ctx: ClientContext):
     try:
@@ -91,15 +94,15 @@ async def receive_loop(ctx: ClientContext):
             message = await receive_secure_message(ctx)
             print(f"\n[Received from server] {message}")
             await front_end_send_message(message, ctx)
-    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
-        print("Receive loop ended (disconnected).")
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError, ValueError) as e:
+        raise Exception(f"Receive loop ended (disconnected). Error: {e}")
 
 async def front_end_send_message(message, ctx: ClientContext):
     try:
         ctx.frontendwriter.write((message + '\n').encode())
         await ctx.frontendwriter.drain()
-    except (ConnectionError, asyncio.CancelledError):
-            print("front end send loop ended (disconnected).")
+    except (ConnectionError, asyncio.CancelledError) as e:
+            raise Exception(f"front end send loop ended (disconnected). Error: {e}")
 
 
 async def front_end_receive_loop(ctx:ClientContext):
@@ -109,8 +112,8 @@ async def front_end_receive_loop(ctx:ClientContext):
             message = data.decode()
             print(f"\n[Received from front end] {message}")
             await send_to_server(message, ctx)
-    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError):
-        print("Frontend receive loop ended (disconnected).")
+    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError) as e:
+        raise Exception(f"Frontend receive loop ended (disconnected). Error: {e}")
 
 
 async def send_to_server(msg, ctx: ClientContext):
@@ -118,8 +121,8 @@ async def send_to_server(msg, ctx: ClientContext):
         secure_msg = construct_secure_message(ctx,msg)
         ctx.backendwriter.write((secure_msg.to_json() + "\n").encode())
         await ctx.backendwriter.drain()
-    except (ConnectionError, asyncio.CancelledError):
-        print("Send loop ended (disconnected).")
+    except (ConnectionError, asyncio.CancelledError) as e:
+        raise Exception(f"Send loop ended (disconnected). Error: {e}")
 
 
     
