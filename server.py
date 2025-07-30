@@ -154,10 +154,7 @@ async def handle_client(reader, writer):
 
         await new_client.join(rooms[0])
 
-        await asyncio.gather(
-            send_loop(new_client),
-            receive_loop(new_client)
-        )
+        await receive_loop(new_client)
 
     except BaseException as e:
         print(f"[handle_client] : {e}")
@@ -260,13 +257,6 @@ async def establish_secure_channel_and_get_aes_key(reader, writer):
     await writer.drain()
 
     return aes_key
-
-
-async def send_loop(client:Client):
-    while True:
-        msg = await asyncio.to_thread(input, "> ")
-        await client.send_secure_message(msg)
-
 
 async def receive_loop(client:Client):
     while True:
