@@ -89,40 +89,30 @@ async def connect_with_server(ipaddr , port, ctx:ClientContext):
         await ctx.backendwriter.wait_closed()
 
 async def receive_loop(ctx: ClientContext):
-    try:
-        while True:
-            message = await receive_secure_message(ctx)
-            print(f"\n[Received from server] {message}")
-            await front_end_send_message(message, ctx)
-    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError, ValueError) as e:
-        raise Exception(f"Receive loop ended (disconnected). Error: {e}")
+    while True:
+        message = await receive_secure_message(ctx)
+        print(f"\n[Received from server] {message}")
+        await front_end_send_message(message, ctx)
 
 async def front_end_send_message(message, ctx: ClientContext):
-    try:
-        ctx.frontendwriter.write((message + '\n').encode())
-        await ctx.frontendwriter.drain()
-    except (ConnectionError, asyncio.CancelledError) as e:
-            raise Exception(f"front end send loop ended (disconnected). Error: {e}")
+    ctx.frontendwriter.write((message + '\n').encode())
+    await ctx.frontendwriter.drain()
 
 
 async def front_end_receive_loop(ctx:ClientContext):
-    try:
-        while True:
-            data = await ctx.frontendreader.readline()
-            message = data.decode()
-            print(f"\n[Received from front end] {message}")
-            await send_to_server(message, ctx)
-    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError) as e:
-        raise Exception(f"Frontend receive loop ended (disconnected). Error: {e}")
+    while True:
+        data = await ctx.frontendreader.readline()
+        if not data:
+            raise ConnectionError("Frontend closed connection")
+        message = data.decode()
+        print(f"\n[Received from front end] {message}")
+        await send_to_server(message, ctx)
 
 
 async def send_to_server(msg, ctx: ClientContext):
-    try:
-        secure_msg = construct_secure_message(ctx,msg)
-        ctx.backendwriter.write((secure_msg.to_json() + "\n").encode())
-        await ctx.backendwriter.drain()
-    except (ConnectionError, asyncio.CancelledError) as e:
-        raise Exception(f"Send loop ended (disconnected). Error: {e}")
+    secure_msg = construct_secure_message(ctx,msg)
+    ctx.backendwriter.write((secure_msg.to_json() + "\n").encode())
+    await ctx.backendwriter.drain()
 
 
     
