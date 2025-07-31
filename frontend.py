@@ -2,6 +2,7 @@ import asyncio
 import sys
 import os
 import curses
+import traceback
 
 #RECEIVE_WINDOW_PARAMS
 r_begin_x = 1
@@ -67,7 +68,8 @@ class OutputReceived:
             self.receivewin.addstr(curY, 1, message)
             curY +=1 
     
-
+server_task = None
+server_is_closed = False
 
 async def main():
     server = await asyncio.start_server(handle_comms, '127.0.0.1' , 33445)
@@ -78,11 +80,15 @@ async def main():
     #    stdout=asyncio.subprocess.PIPE,
     #    stderr=asyncio.subprocess.PIPE
     #)
-
-    async with server:
-        await server.serve_forever()
+    global server_task
+    server_task = asyncio.create_task(server.serve_forever())
+    try:
+        await server_task
+    except asyncio.CancelledError:
+        pass
 
 async def handle_comms(reader, writer):
+    stdscr = None
     try:
         serverip = input("Enter server ip: ")
         port = input("Enter server port: ")
@@ -104,46 +110,45 @@ async def handle_comms(reader, writer):
                 receive_loop(reader, receivewin),
                 send_loop(inputwin, writer)
         )
-    except Exception as e:
-        print(e)
+    except BaseException:
+        global server_is_closed
+        server_is_closed = True
+        if stdscr is not None:
+            stdscr.clear()
+            stdscr.refresh()
+            stdscr.move(0,0)
+            curses.endwin()
+        traceback.print_exc()
+        print("handle client exception")
+        if server_task is not None:
+            server_task.cancel()
     finally:
-        curses.endwin()
+        print("final block")
         writer.close()
         await writer.wait_closed()
 
 async def receive_loop(backendreader, receivewin):
-    try:
-        outrecv = OutputReceived(receivewin)
-        while True:
-            data = await backendreader.readline()
-            if not data:
-                print("backend disc")
-                sys.exit()
-            message = data.decode().strip()
-            outrecv.add_message(message)
-            #print(f"received from backend: {message}")
-    except (ConnectionError, asyncio.IncompleteReadError, asyncio.CancelledError) as e:
-        raise Exception(f"connection to backend was lost while during receive loop. Error:{e}")
+    outrecv = OutputReceived(receivewin)
+    while True:
+        if server_is_closed:
+            break
+        data = await backendreader.readline()
+        if not data:
+            raise ConnectionError("back end disconnected")
+        message = data.decode().strip()
+        outrecv.add_message(message)
 
 async def send_msg(backendwriter, msg):
-    try:
         backendwriter.write((msg + '\n').encode())
         await backendwriter.drain()
-    except (ConnectionError, asyncio.CancelledErroras) as e:
-        raise Exception(f"connection to back end was lost during send loop. Error:{e}")
 
 
 async def send_loop(inputwin, backendwriter):
-    try:
-        nbi = NonBlockingInput(inputwin, backendwriter)
-        while True:
-            await nbi.build_input()
-            await asyncio.sleep(0.05)
-            #userinput = await asyncio.to_thread(input, "> ")
-            #backendwriter.write((userinput + '\n').encode())
-            #await backendwriter.drain()
-    except Exception as e:
-        raise Exception(f"connection to backend was lost while sending. Error:{e}")
-
+    nbi = NonBlockingInput(inputwin, backendwriter)
+    while True:
+        if server_is_closed:
+            break
+        await nbi.build_input()
+        await asyncio.sleep(0.05)
 
 asyncio.run(main())
