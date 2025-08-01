@@ -119,11 +119,9 @@ async def handle_comms(reader, writer):
             stdscr.move(0,0)
             curses.endwin()
         traceback.print_exc()
-        print("handle client exception")
         if server_task is not None:
             server_task.cancel()
     finally:
-        print("final block")
         writer.close()
         await writer.wait_closed()
 
