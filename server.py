@@ -15,9 +15,13 @@ from cryptography.hazmat.primitives import serialization, hashes
 
 host = '127.0.0.1'
 port = 4444
-
 client_list = []
+client_list_lock = asyncio.Lock()
 rooms = []
+rooms_lock = asyncio.Lock()
+
+nonce_dict = {}
+nonce_lock = asyncio.Lock()
 
 MAIN_MENU_CODE = '#00000000'
 
@@ -29,8 +33,10 @@ class Client:
         self.writer = writer
         self.aes_key = aes_key
         self.owned_rooms_count = 0
-        self.current_room = rooms[0] #main_menu 
-        rooms[0].add_member(self)
+    async def async_init(self):
+        async with rooms_lock:
+            self.current_room = rooms[0] #rooms[0] is main menu
+            await rooms[0].add_member(self)
     async def send_secure_message(self, message):
         secure_msg = construct_secure_message(self.aes_key, message)
         self.writer.write((secure_msg.to_json() + "\n").encode())
@@ -39,42 +45,44 @@ class Client:
         message = await receive_secure_message_and_log(self.reader, self.writer, self.aes_key)
         message = message.strip()
         return message
-    def switch_room(self, room):
+    async def switch_room(self, target_room):
         assert self.current_room
-        assert self in self.current_room.members
-        if room == self.current_room:
+        assert await self.current_room.client_is_in_room(self)
+        if target_room == self.current_room:
             return
-        self.current_room.members.remove(self)
-        self.current_room = room
-        room.add_member(self)
+        await self.current_room.remove_member(self)
+        self.current_room = target_room
+        await target_room.add_member(self)
     async def join(self, room: 'Room'):
-        if room.has_banned_user_with_username(self.username):
+        if await room.has_banned_user_with_username(self.username):
             message = f"Server : You are banned from {room.code}. Unless the owner unbans you, you can't join."
             await self.send_secure_message(message)
             return
-        if room.has_password():
+        if await room.has_password():
             message = f"Server: Enter password for this room ({room.code}): "
             await self.send_secure_message(message)
             received_password = await self.receive_secure_message()
-            if room.is_correct_password(received_password):
-                self.switch_room(room)
+            if await room.is_correct_password(received_password):
+                await self.switch_room(room)
                 message = f"Server: You have successfully entered the room {room.code}."
                 await self.send_secure_message(message)
             else:
                 message = "Server: Wrong password."
                 await self.send_secure_message(message)
         else:
-            if not self.current_room and room.code == MAIN_MENU_CODE: #for initial connection when entering menu
-                self.current_room = room
-                room.add_member(self)
-            else:
-                self.switch_room(room)
+            await self.switch_room(room)
             message = f"Server: You have successfully entered the room {room.code}."
             await self.send_secure_message(message)
     async def create_room(self, room_code:str):
-        for room in rooms:
-            assert(room.code != room_code)
-        r = Room(self.username, room_code)
+        print("in create_room")
+        async with rooms_lock:
+            for room in rooms:
+                if(room.code == room_code):
+                    print("already existing room was tried to be created, shouldn't be possible")
+                    return
+            print("checked for same rooms, creating room")
+            r = Room(self.username, room_code)
+            rooms.append(r)
         self.owned_rooms_count += 1
         message = f"Server: Room {room_code} has been created and is now owned by you."
         await self.send_secure_message(message)
@@ -83,6 +91,10 @@ class Client:
         await self.send_secure_message(message)
         received = await self.receive_secure_message()
         return received
+    async def exit_room(self):
+        await self.join(rooms[0]) #main menu
+        message = "Server: You are in the main menu now."
+        await self.send_secure_message(message)
 
 
 
@@ -93,50 +105,89 @@ class Room:
         self.password = None
         self.members = []
         self.banned_members = []
+        self.lock = asyncio.Lock()
     async def set_password(self, attempter:Client):
-        if attempter.username != self.owner_name:
-            message = "Server: You don't have the authority to do that in this room."
-            await attempter.send_secure_message(message)
-            return
-        if self.has_password():
-            message = "Server: Enter current password"
-            received_password_old = await attempter.prompt_and_get_response(message)
-            if self.password != received_password_old:
-                message = "Server: Wrong password. To try again, run the command again."
+        async with self.lock:
+            if attempter.username != self.owner_name:
+                message = "Server: You don't have the authority to do that in this room."
                 await attempter.send_secure_message(message)
                 return
-            message = "Server: Enter new password"
-            received_password_new = await attempter.prompt_and_get_response(message)
-            if self.password == received_password_old:
-                message = "Server: New password cannot be the same as old password."
+            if self.password != None:
+                message = "Server: Enter current password"
+                received_password_old = await attempter.prompt_and_get_response(message)
+                if self.password != received_password_old:
+                    message = "Server: Wrong password. To try again, run the command again."
+                    await attempter.send_secure_message(message)
+                    return
+                message = "Server: Enter new password"
+                received_password_new = await attempter.prompt_and_get_response(message)
+                if received_password_new == received_password_old:
+                    message = "Server: New password cannot be the same as old password."
+                    await attempter.send_secure_message(message)
+                    return
+                self.password = received_password_new
+                message = "Server: Password change successful"
                 await attempter.send_secure_message(message)
-                return
-            self.password = received_password_new
-            message = "Server: Password change successful"
-            await attempter.send_secure_message(message)
-        else:
-            message = "Server: Enter new password"
-            received_password = await attempter.prompt_and_get_response(message)
-            self.password = received_password
-            message = "Server: Password was set successfully"
-            await attempter.send_secure_message(message)
-    def has_password(self):
-        return self.password is not None
-    def is_correct_password(self, password):
-        return password == self.password
-    def add_member(self, client:Client):
-        self.members.append(client)
-    async def ban(self, to_be_banned_username:str):
-        self.banned_members.append(to_be_banned_username)
-        for cl in self.members:
+            else:
+                message = "Server: Enter new password"
+                received_password = await attempter.prompt_and_get_response(message)
+                self.password = received_password
+                message = "Server: Password was set successfully"
+                await attempter.send_secure_message(message)
+    async def has_password(self):
+        async with self.lock:
+            return self.password is not None
+    async def is_correct_password(self, password):
+        async with self.lock:
+            return password == self.password
+    async def is_owner(self, client_username:str):
+        async with self.lock:
+            return client_username == self.owner_name
+    async def add_member(self, client:Client):
+        async with self.lock:
+            self.members.append(client)
+    async def remove_member(self, client:Client):
+        async with self.lock:
+            self.members.remove(client)
+    async def client_is_in_room(self, client:Client):
+        async with self.lock:
+            return client in self.members
+    async def broadcast_message(self, message:str):
+        async with self.lock:
+            members_copy = self.members[:]
+        for cl in members_copy:
+            await cl.send_secure_message(message)
+    async def kick_user_with_username(self, to_be_kicked_username):
+        async with self.lock:
+            members_copy = self.members[:]
+        for cl in members_copy:
+            if cl.username == to_be_kicked_username:
+                message = f"You have been kicked from the room {self.code}. Sending you to main menu now..."
+                await cl.send_secure_message(message)
+                await cl.exit_room()
+                break
+    async def kick_all_users_except_owner(self):
+        async with self.lock:
+            members_copy = self.members[:]
+        for cl in members_copy:
+            if cl.username != self.owner_name:
+                message = f"You have been kicked from the room {self.code}. Sending you to main menu now..."
+                await cl.send_secure_message(message)
+                await cl.exit_room()
+    async def ban_user_with_username(self, to_be_banned_username:str):
+        async with self.lock:
+            self.banned_members.append(to_be_banned_username)
+            members_copy = self.members[:]
+        for cl in members_copy:
             if cl.username == to_be_banned_username:
                 message = f"Server: You have banned from room {self.code} by {self.owner_name}."
                 await cl.send_secure_message(message)
-                await exit_room(cl)
+                await cl.exit_room()
             else:
                 await cl.send_secure_message(f"Server: {to_be_banned_username} has been banned from this room({self.code}).")
-    def has_banned_user_with_username(self, username:str):
-        return username in self.banned_members
+    async def has_banned_user_with_username(self, username:str):
+        async with self.lock:
+            return username in self.banned_members
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
@@ -144,26 +195,23 @@ async def handle_client(reader, writer):
     new_client = None
     try:
         aes_key = await establish_secure_channel_and_get_aes_key(reader, writer)
-
         print("Secure channel established.")
 
         username = await start_authentication_sequence(reader, writer, aes_key)
-
         new_client = Client(addr, username, reader, writer, aes_key)
-        client_list.append(new_client)
-
-        await new_client.join(rooms[0])
-
+        await new_client.async_init()
+        async with client_list_lock:
+            client_list.append(new_client)
         await receive_loop(new_client)
 
     except BaseException as e:
         print(f"[handle_client] : {e}")
         traceback.print_exc()
     finally:
-        print("final block")
         if new_client:
-            if new_client in client_list:
-                client_list.remove(new_client)
+            async with client_list_lock:
+                if new_client in client_list:
+                    client_list.remove(new_client)
         writer.close()
         await writer.wait_closed()
 
@@ -219,14 +267,13 @@ async def start_authentication_sequence(reader, writer, aes_key):
 
 async def establish_secure_channel_and_get_aes_key(reader, writer):
 
-    data = await reader.readline()
-    msg = Message.from_json(data.decode())
+    data_bytes = await reader.readline()
+    msg_obj = Message.from_json(data_bytes.decode())
 
-    if msg.type != "key_exchange":
-        print("Unexpected message type.")
-        writer.close()
+    if msg_obj.type != "key_exchange":
+        raise TypeError("Unexpected message type.")
 
-    public_key_pem = msg.payload["rsa_public_key"]
+    public_key_pem = msg_obj.payload["rsa_public_key"]
     print(f"Received public key from client:\n{public_key_pem}")
     public_key = serialization.load_pem_public_key(public_key_pem.encode())
 
@@ -247,12 +294,12 @@ async def establish_secure_channel_and_get_aes_key(reader, writer):
 
     encrypted_key_str = base64.b64encode(encrypted_aes_key).decode('utf-8')
 
-    msg = Message(
+    msg_obj = Message(
         type="aes_key",
         payload={"encrypted_aes_key": encrypted_key_str}
     )
 
-    json_str = msg.to_json() + '\n'
+    json_str = msg_obj.to_json() + '\n'
     writer.write(json_str.encode())
     await writer.drain()
 
@@ -262,18 +309,19 @@ async def receive_loop(client:Client):
     while True:
         message = await client.receive_secure_message()
         print(f"\n[Received] {message}")
+        client_room = client.current_room
         if message.startswith('/'):
             await handle_command(client,message)
         else:
             message = f"{client.username}: {message}"
-            if not client.current_room.code == MAIN_MENU_CODE:
-                for cl in client.current_room.members:
-                    await cl.send_secure_message(message)
+            if not client_room.code == MAIN_MENU_CODE:
+                await client_room.broadcast_message(message)
             else:
                 message = "Server: You can't message in the main menu, type /help for help"
                 await client.send_secure_message(message)
 
 async def handle_command(client: Client, message: str):
+    print("in handle_command")
     parts = message[1:].strip().split()
     if not parts:
         await client.send_secure_message("Server: Invalid command. /help for help")
@@ -293,13 +341,14 @@ async def handle_command(client: Client, message: str):
 
 #Commands start here
 
-async def list_rooms(client:Client):
+async def list_rooms_cmd(client:Client):
     message = ""
-    for room in rooms:
-        message += f"{room.code}\n"
+    async with rooms_lock:
+        for room in rooms:
+            message += f"{room.code}\n"
     await client.send_secure_message(message)
 
-async def send_help_message(client:Client):
+async def send_help_message_cmd(client:Client):
     message = """Server: \"To list the rooms already present use \'/list\' command.
     To join a room, use \'/join\'  e.g. \'/join #12345678\', (if the room has a password, you will have to provide one).
     If you wish to create a room, join a non-existing room and after entering use \'/setpasswd\' command to put a password to it if you wish.
@@ -307,65 +356,59 @@ async def send_help_message(client:Client):
     To receive this help message use the \'/help\' command.\""""
     await client.send_secure_message(message)
 
-async def exit_room(client:Client):
-    await client.join(rooms[0])
-    message = "Server: You are in the main menu now."
-    await client.send_secure_message(message)
+async def exit_room_cmd(client:Client):
+    await client.exit_room()
 
 MAX_ROOMS_PER_CLIENT = 3
-async def join_room(client:Client, room_code):
+async def join_room_cmd(client:Client, room_code):
+    print("in join room")
     if not room_code.startswith('#') or len(room_code) != 9 or not room_code[1:].isalnum():
         await client.send_secure_message("Server: Room code must be in format '#12345678' and alphanumeric.")
         return
-
-    for room in rooms:
-        if room_code == room.code:
-            await client.join(room)
-            return
+    async with rooms_lock:
+        for room in rooms:
+            if room_code == room.code:
+                await client.join(room)
+                return
+    print("passed room check 1")
     if client.owned_rooms_count < MAX_ROOMS_PER_CLIENT:
+        print("calling client.create_room(room_code)")
         await client.create_room(room_code)
     else:
         message = f"Server: You already own {MAX_ROOMS_PER_CLIENT} rooms, you can't create more."
         await client.send_secure_message(message)
 
-async def set_room_password(client:Client):
-    if client.current_room.code == MAIN_MENU_CODE:
+async def set_room_password_cmd(client:Client):
+    client_room = client.current_room
+    if client_room.code == MAIN_MENU_CODE:
         message = "Server: You can't do that in the main menu."
         await client.send_secure_message(message)
     else:
-        r = client.current_room
-        await r.set_password(client)
+        await client_room.set_password(client)
 
-async def kick_all(client:Client):
+async def kick_all_users_except_owner_cmd(client:Client):
     r = client.current_room
-    if r.owner_name != client.username:
+    if not await r.is_owner(client.username):
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
         return
+    await r.kick_all_users_except_owner()
 
-    for cl in client.current_room.members:
-        if cl != client:
-            await kick(client, cl.username)
-
-async def kick(client:Client, to_be_kicked:str):
+async def kick_user_with_username_cmd(client:Client, to_be_kicked_username:str):
     r = client.current_room
-    if r.owner_name != client.username:
+    if not await r.is_owner(client.username):
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
         return
-    if to_be_kicked == client.username:
+    if to_be_kicked_username == client.username:
         message = f"Server: You can't kick yourself. You can use the \'/exitroom\' command to exit the room."
         await client.send_secure_message(message)
         return
-    for cl in r.members:
-        if cl.username == to_be_kicked:
-            message = f"Server: You have been kicked by {client.username}"
-            await exit_room(cl)
-            await cl.send_secure_message(message)
+    await r.kick_user_with_username(to_be_kicked_username)
 
-async def ban(client:Client, to_ban_username:str):
+async def ban_user_with_username_cmd(client:Client, to_ban_username:str):
     r = client.current_room
-    if r.owner_name != client.username:
+    if not await r.is_owner(client.username): 
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
         return
@@ -373,18 +416,18 @@ async def ban(client:Client, to_ban_username:str):
         message = f"Server: You can't ban yourself"
         await client.send_secure_message(message)
         return
-    await r.ban(to_ban_username)
+    await r.ban_user_with_username(to_ban_username)
 
 commands = {
-    #f"{command_name}:(func_name, num_of_args)
-    "list":(list_rooms, 0),
-    "help":(send_help_message, 0),
-    "join":(join_room, 1),
-    "setpasswd":(set_room_password, 0),
-    "exitroom":(exit_room, 0),
-    "kickall":(kick_all, 0),
-    "kick":(kick, 1),
-    "ban":(ban, 1)
+    #"{command_name}":(func_name, num_of_args)
+    "list":(list_rooms_cmd, 0),
+    "help":(send_help_message_cmd, 0),
+    "join":(join_room_cmd, 1),
+    "setpasswd":(set_room_password_cmd, 0),
+    "exitroom":(exit_room_cmd, 0),
+    "kickall":(kick_all_users_except_owner_cmd, 0),
+    "kick":(kick_user_with_username_cmd, 1),
+    "ban":(ban_user_with_username_cmd, 1)
 }
 
 #Commands end here
@@ -396,12 +439,12 @@ async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : 
 
     msg = Message.from_json(data.decode())
 
-    nonce = base64.b64decode(msg.nonce)
+    nonce_bytes = base64.b64decode(msg.nonce)
 
-    log_nonce(nonce, writer)
+    await log_nonce(nonce_bytes, writer)
 
-    ciphertext = base64.b64decode(msg.payload["ciphertext"])
-    tag = base64.b64decode(msg.payload["tag"])
+    ciphertext_bytes = base64.b64decode(msg.payload["ciphertext"])
+    tag_bytes = base64.b64decode(msg.payload["tag"])
     timestamp = msg.timestamp
     received_hmac = base64.b64decode(msg.hmac)
 
@@ -410,9 +453,9 @@ async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : 
         raise ValueError("Message timestamp is too old or in the future.")
     
     data_to_auth = (
-        base64.b64encode(nonce).decode() +
-        base64.b64encode(ciphertext).decode() +
-        base64.b64encode(tag).decode() +
+        base64.b64encode(nonce_bytes).decode() +
+        base64.b64encode(ciphertext_bytes).decode() +
+        base64.b64encode(tag_bytes).decode() +
         str(timestamp)
     ).encode()
 
@@ -421,9 +464,9 @@ async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : 
     if not hmac.compare_digest(received_hmac, expected_hmac):
         raise ValueError("HMAC authentication failed.")
 
-    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce, tag))
+    cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_bytes, tag_bytes))
     decryptor = cipher.decryptor()
-    plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+    plaintext = decryptor.update(ciphertext_bytes) + decryptor.finalize()
 
     return plaintext.decode()
 
@@ -463,43 +506,33 @@ def construct_secure_message(aes_key: bytes, plaintext: str) -> Message:
     return msg
 
 
-NONCE_AWAIT_TIME = 30 # or whatever your nonce window is
+NONCE_LIVE_TIME_MAX = 30 #how long the nonce stays in memory
 
-def log_nonce(nonce: bytes, writer: asyncio.StreamWriter): #maybe make this in memory
-    try:
-        with open("nonces.txt", "r") as f:
-            lines = f.read().splitlines()
-    except FileNotFoundError:
-        lines = []
-    
-    nonce_hex = nonce.hex()
+async def log_nonce(nonce_bytes: bytes, writer: asyncio.StreamWriter):
+    new_nonce_hex = nonce_bytes.hex()
+    async with nonce_lock:
 
-    new_lines = []
-    current_time = int(time.time())
+        if new_nonce_hex in nonce_dict:
+            raise ValueError(f"Replay attack detected from {writer.get_extra_info('peername')} with nonce: {nonce_bytes}")
 
-    for line in lines:
-        try:
-            prev_nonce, timestamp = line.split(" ")
-            timestamp = int(timestamp)
-        except ValueError:
-            continue  # skip malformed lines
+        current_time = int(time.time())
+        to_remove = []
+        
+        for nonce_hex, timestamp in nonce_dict.items():
+            if current_time - timestamp > NONCE_LIVE_TIME_MAX:
+                to_remove.append(nonce_hex)
 
-        if current_time - timestamp < NONCE_AWAIT_TIME:
-            new_lines.append(f"{prev_nonce} {timestamp}")
-            if prev_nonce == nonce_hex:
-                raise ValueError(f"Replay attack detected from {writer.get_extra_info('peername')} with nonce: {nonce}")
-
-    new_lines.append(f"{nonce_hex} {current_time}")
-
-    with open("nonces.txt", "w") as f:
-        for line in new_lines:
-            f.write(f"{line}\n")
+        for nonce_hex in to_remove:
+            del nonce_dict[nonce_hex]
+        
+        nonce_dict[new_nonce_hex] = current_time
 
 
 
 async def main():
     main_menu = Room("", MAIN_MENU_CODE)
-    rooms.append(main_menu)
+    async with rooms_lock: #not sure if needed
+        rooms.append(main_menu)
 
     server = await asyncio.start_server(handle_client, host, port)
     print(f"Server listening on {host}:{port}")
