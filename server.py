@@ -12,6 +12,26 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey 
 from cryptography.hazmat.primitives import serialization, hashes
 
+import logging
+import logging.config
+
+logger = logging.getLogger()
+logger.setLevel(logging.DEBUG)
+
+fileHandler = logging.FileHandler('server.log')
+fileHandler.setLevel(logging.DEBUG)
+
+consoleHandler = logging.StreamHandler()
+consoleHandler.setLevel(logging.DEBUG)
+
+formatter = logging.Formatter('%(asctime)s\t%(levelname)s\t%(message)s')
+
+fileHandler.setFormatter(formatter)
+consoleHandler.setFormatter(formatter)
+
+logger.addHandler(fileHandler)
+logger.addHandler(consoleHandler)
+
 
 host = '127.0.0.1'
 port = 4444
@@ -24,6 +44,9 @@ nonce_dict = {}
 nonce_lock = asyncio.Lock()
 
 MAIN_MENU_CODE = '#00000000'
+
+
+
 
 class Client:
     def __init__(self, ipaddress, username, reader : asyncio.StreamReader, writer: asyncio.StreamWriter, aes_key):
@@ -74,13 +97,11 @@ class Client:
             message = f"Server: You have successfully entered the room {room.code}."
             await self.send_secure_message(message)
     async def create_room(self, room_code:str):
-        print("in create_room")
         async with rooms_lock:
             for room in rooms:
                 if(room.code == room_code):
-                    print("already existing room was tried to be created, shouldn't be possible")
-                    return
-            print("checked for same rooms, creating room")
+                    logger.error("Already existing room was tried to be created, shouldn't be possible. Client that made the request is: '{self.username}' with IP address: {self.ipaddress}")
+                    raise Exception("Bad Room Create")
             r = Room(self.username, room_code)
             rooms.append(r)
         self.owned_rooms_count += 1
@@ -191,11 +212,12 @@ class Room:
 
 async def handle_client(reader, writer):
     addr = writer.get_extra_info('peername')
-    print(f"Connection from {addr}")
+    logger.info("Received connection from ip address: {addr}")
     new_client = None
+    username = None
     try:
         aes_key = await establish_secure_channel_and_get_aes_key(reader, writer)
-        print("Secure channel established.")
+        logger.info("Secure channel established with client '{addr}'.")
 
         username = await start_authentication_sequence(reader, writer, aes_key)
         new_client = Client(addr, username, reader, writer, aes_key)
@@ -204,8 +226,9 @@ async def handle_client(reader, writer):
             client_list.append(new_client)
         await receive_loop(new_client)
 
-    except BaseException as e:
-        print(f"[handle_client] : {e}")
+    except BaseException:
+        if username is not None:
+            logger.info(f"Lost connection with client with username: {username}, ipaddress: {addr}")
         traceback.print_exc()
     finally:
         if new_client:
@@ -214,11 +237,12 @@ async def handle_client(reader, writer):
                     client_list.remove(new_client)
         writer.close()
         await writer.wait_closed()
+        await write_nonce_to_log_file()
 
 
 async def start_authentication_sequence(reader, writer, aes_key):
-
-    print("Starting authentication sequence.")
+    addr = writer.get_extra_info('peername')
+    logger.info(f"Starting authentication sequence with client '{addr}'.")
 
     msg = "Server: Enter username"
     secure_msg = construct_secure_message(aes_key, msg)
@@ -237,6 +261,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
     password = password.strip()
     count = 1
     while not (username == "usertest" and password == "password"):
+        logger.warning(f"Received wrong username,password pair {username:password}. Sender IP:{addr}")
         msg = "Server: Wrong Credentials, try again.\nServer: Enter username"
         secure_msg = construct_secure_message(aes_key, msg)
         writer.write((secure_msg.to_json() + "\n").encode())
@@ -254,6 +279,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
         password = password.strip()
         count += 1
         if count == 3:
+            logger.warning(f"Client with IP Address:{addr} sent 3 wrong password requests, disconnecting user...")
             raise Exception("Too many wrong attempts")
     
 
@@ -274,12 +300,13 @@ async def establish_secure_channel_and_get_aes_key(reader, writer):
         raise TypeError("Unexpected message type.")
 
     public_key_pem = msg_obj.payload["rsa_public_key"]
-    print(f"Received public key from client:\n{public_key_pem}")
+    logger.info(f"Received public key from client{writer.get_extra_info('peername')}:\n{public_key_pem}")
     public_key = serialization.load_pem_public_key(public_key_pem.encode())
 
     aes_key = os.urandom(32)  # 256-bit AES key
 
     if not isinstance(public_key, RSAPublicKey):
+        logger.warning(f"Received bad public key: {public_key}, Sender IP: {writer.get_extra_info('peername')}")
         raise TypeError("Only RSA public keys are supported for encryption.")
 
     # Encrypt AES key with client's RSA public key
@@ -308,7 +335,7 @@ async def establish_secure_channel_and_get_aes_key(reader, writer):
 async def receive_loop(client:Client):
     while True:
         message = await client.receive_secure_message()
-        print(f"\n[Received] {message}")
+        logger.info(f"Received message: {message}\t[{client.username}],[{client.ipaddress}]: ")
         client_room = client.current_room
         if message.startswith('/'):
             await handle_command(client,message)
@@ -321,7 +348,6 @@ async def receive_loop(client:Client):
                 await client.send_secure_message(message)
 
 async def handle_command(client: Client, message: str):
-    print("in handle_command")
     parts = message[1:].strip().split()
     if not parts:
         await client.send_secure_message("Server: Invalid command. /help for help")
@@ -361,7 +387,6 @@ async def exit_room_cmd(client:Client):
 
 MAX_ROOMS_PER_CLIENT = 3
 async def join_room_cmd(client:Client, room_code):
-    print("in join room")
     if not room_code.startswith('#') or len(room_code) != 9 or not room_code[1:].isalnum():
         await client.send_secure_message("Server: Room code must be in format '#12345678' and alphanumeric.")
         return
@@ -370,9 +395,7 @@ async def join_room_cmd(client:Client, room_code):
             if room_code == room.code:
                 await client.join(room)
                 return
-    print("passed room check 1")
     if client.owned_rooms_count < MAX_ROOMS_PER_CLIENT:
-        print("calling client.create_room(room_code)")
         await client.create_room(room_code)
     else:
         message = f"Server: You already own {MAX_ROOMS_PER_CLIENT} rooms, you can't create more."
@@ -450,7 +473,8 @@ async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : 
 
     current_time = int(time.time())
     if abs(current_time - timestamp) > max_delay_sec:
-        raise ValueError("Message timestamp is too old or in the future.")
+        logger.warning(f"Received message with wrong timestamp: {data.decode()}, Sender IP address: {writer.get_extra_info('peername')}")
+        raise ValueError("Bad Message Timestamp")
     
     data_to_auth = (
         base64.b64encode(nonce_bytes).decode() +
@@ -462,6 +486,7 @@ async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : 
     expected_hmac = hmac.new(aes_key, data_to_auth, hashlib.sha256).digest()
 
     if not hmac.compare_digest(received_hmac, expected_hmac):
+        logger.warning(f"HMAC authentication of message: {data.decode()} failed. Sender IP address: {writer.get_extra_info('peername')}")
         raise ValueError("HMAC authentication failed.")
 
     cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_bytes, tag_bytes))
@@ -513,7 +538,8 @@ async def log_nonce(nonce_bytes: bytes, writer: asyncio.StreamWriter):
     async with nonce_lock:
 
         if new_nonce_hex in nonce_dict:
-            raise ValueError(f"Replay attack detected from {writer.get_extra_info('peername')} with nonce: {nonce_bytes}")
+            logger.warning(f"Replay attack detected from {writer.get_extra_info('peername')} with nonce: {nonce_bytes}")
+            raise ValueError("Bad Nonce")
 
         current_time = int(time.time())
         to_remove = []
@@ -526,6 +552,13 @@ async def log_nonce(nonce_bytes: bytes, writer: asyncio.StreamWriter):
             del nonce_dict[nonce_hex]
         
         nonce_dict[new_nonce_hex] = current_time
+    
+async def write_nonce_to_log_file():
+    async with nonce_lock:
+        logger.debug(f"NONCE ENTRIES ------------------------------------------------------------------------")
+        for nonce_hex, timestamp in nonce_dict.items():
+            logger.debug(f"NONCE: {nonce_hex}, TIMESTAMP: {timestamp}")
+        logger.debug(f"NONCE ENTRIES OVER--------------------------------------------------------------------")
 
 
 
@@ -535,7 +568,7 @@ async def main():
         rooms.append(main_menu)
 
     server = await asyncio.start_server(handle_client, host, port)
-    print(f"Server listening on {host}:{port}")
+    logger.info(f'Server started listening on {host}:{port}')
     async with server:
         await server.serve_forever()
 
