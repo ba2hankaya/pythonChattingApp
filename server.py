@@ -19,7 +19,10 @@ logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
 
 fileHandler = logging.FileHandler('server.log')
-fileHandler.setLevel(logging.DEBUG)
+fileHandler.setLevel(logging.INFO)
+
+fileHandler2 = logging.FileHandler('server.debug.log')
+fileHandler2.setLevel(logging.DEBUG)
 
 consoleHandler = logging.StreamHandler()
 consoleHandler.setLevel(logging.DEBUG)
@@ -27,9 +30,11 @@ consoleHandler.setLevel(logging.DEBUG)
 formatter = logging.Formatter('%(asctime)s\t%(levelname)s\t%(message)s')
 
 fileHandler.setFormatter(formatter)
+fileHandler2.setFormatter(formatter)
 consoleHandler.setFormatter(formatter)
 
 logger.addHandler(fileHandler)
+logger.addHandler(fileHandler2)
 logger.addHandler(consoleHandler)
 
 
@@ -64,6 +69,7 @@ class Client:
         secure_msg = construct_secure_message(self.aes_key, message)
         self.writer.write((secure_msg.to_json() + "\n").encode())
         await self.writer.drain()
+        logger.debug(f"Sent client '{self.username}' with IP address '{self.ipaddress}' message: '{message}'")
     async def receive_secure_message(self):
         message = await receive_secure_message_and_log(self.reader, self.writer, self.aes_key)
         message = message.strip()
@@ -100,10 +106,11 @@ class Client:
         async with rooms_lock:
             for room in rooms:
                 if(room.code == room_code):
-                    logger.error("Already existing room was tried to be created, shouldn't be possible. Client that made the request is: '{self.username}' with IP address: {self.ipaddress}")
+                    logger.error(f"Already existing room was tried to be created, shouldn't be possible. Client that made the request is: '{self.username}' with IP address: '{self.ipaddress}'")
                     raise Exception("Bad Room Create")
             r = Room(self.username, room_code)
             rooms.append(r)
+            logger.debug(f"New room was created with code '{room_code}' by client '{self.username}', owner is '{r.owner_name}'")
         self.owned_rooms_count += 1
         message = f"Server: Room {room_code} has been created and is now owned by you."
         await self.send_secure_message(message)
@@ -111,6 +118,7 @@ class Client:
     async def prompt_and_get_response(self, message):
         await self.send_secure_message(message)
         received = await self.receive_secure_message()
+        logger.debug(f"Sent client '{self.username}' with IP Address '{self.ipaddress}' prompt: '{message}' and received back: '{received}'")
         return received
     async def exit_room(self):
         await self.join(rooms[0]) #main menu
@@ -149,12 +157,14 @@ class Room:
                 self.password = received_password_new
                 message = "Server: Password change successful"
                 await attempter.send_secure_message(message)
+                logger.debug(f"Password of room '{self.code}' owned by '{self.owner_name}' has been changed from '{received_password_old}' to '{self.password}', attempter was '{attempter.username}' with IP address '{attempter.ipaddress}'")
             else:
                 message = "Server: Enter new password"
                 received_password = await attempter.prompt_and_get_response(message)
                 self.password = received_password
                 message = "Server: Password was set successfully"
                 await attempter.send_secure_message(message)
+                logger.debug(f"Password of room '{self.code}' owned by '{self.owner_name}' was set to '{self.password}', attempter was '{attempter.username}' with IP address '{attempter.ipaddress}'")
     async def has_password(self):
         async with self.lock:
             return self.password is not None
@@ -211,13 +221,13 @@ class Room:
             return username in self.banned_members
 
 async def handle_client(reader, writer):
-    addr = writer.get_extra_info('peername')
-    logger.info("Received connection from ip address: {addr}")
+    addr, cliport = writer.get_extra_info('peername')
+    logger.info(f"Received connection from ip address: '{addr}'")
     new_client = None
     username = None
     try:
         aes_key = await establish_secure_channel_and_get_aes_key(reader, writer)
-        logger.info("Secure channel established with client '{addr}'.")
+        logger.info(f"Secure channel established with client '{addr}'.")
 
         username = await start_authentication_sequence(reader, writer, aes_key)
         new_client = Client(addr, username, reader, writer, aes_key)
@@ -228,7 +238,7 @@ async def handle_client(reader, writer):
 
     except BaseException:
         if username is not None:
-            logger.info(f"Lost connection with client with username: {username}, ipaddress: {addr}")
+            logger.info(f"Lost connection with client with username: '{username}', ipaddress: '{addr}'")
         traceback.print_exc()
     finally:
         if new_client:
@@ -241,7 +251,7 @@ async def handle_client(reader, writer):
 
 
 async def start_authentication_sequence(reader, writer, aes_key):
-    addr = writer.get_extra_info('peername')
+    addr, cliport = writer.get_extra_info('peername')
     logger.info(f"Starting authentication sequence with client '{addr}'.")
 
     msg = "Server: Enter username"
@@ -261,7 +271,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
     password = password.strip()
     count = 1
     while not (username == "usertest" and password == "password"):
-        logger.warning(f"Received wrong username,password pair {username:password}. Sender IP:{addr}")
+        logger.warning(f"Received wrong username:password pair '{username}:{password}'. Sender IP:'{addr}'")
         msg = "Server: Wrong Credentials, try again.\nServer: Enter username"
         secure_msg = construct_secure_message(aes_key, msg)
         writer.write((secure_msg.to_json() + "\n").encode())
@@ -279,10 +289,10 @@ async def start_authentication_sequence(reader, writer, aes_key):
         password = password.strip()
         count += 1
         if count == 3:
-            logger.warning(f"Client with IP Address:{addr} sent 3 wrong password requests, disconnecting user...")
+            logger.warning(f"Client with IP Address:'{addr}' sent 3 wrong password requests, disconnecting user...")
             raise Exception("Too many wrong attempts")
     
-
+    logger.info(f"client with IP address: '{addr}' logged in successfully with username: '{username}'")
     msg = "Server: Login successful."
     secure_msg = construct_secure_message(aes_key, msg)
     writer.write((secure_msg.to_json() + "\n").encode())
@@ -292,7 +302,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
 
 
 async def establish_secure_channel_and_get_aes_key(reader, writer):
-
+    addr, cliport = writer.get_extra_info('peername')
     data_bytes = await reader.readline()
     msg_obj = Message.from_json(data_bytes.decode())
 
@@ -300,13 +310,13 @@ async def establish_secure_channel_and_get_aes_key(reader, writer):
         raise TypeError("Unexpected message type.")
 
     public_key_pem = msg_obj.payload["rsa_public_key"]
-    logger.info(f"Received public key from client{writer.get_extra_info('peername')}:\n{public_key_pem}")
+    logger.debug(f"Received public key from client with IP address '{addr}':\n{public_key_pem}")
     public_key = serialization.load_pem_public_key(public_key_pem.encode())
 
     aes_key = os.urandom(32)  # 256-bit AES key
 
     if not isinstance(public_key, RSAPublicKey):
-        logger.warning(f"Received bad public key: {public_key}, Sender IP: {writer.get_extra_info('peername')}")
+        logger.warning(f"Received bad public key:\n{public_key}, Sender IP:\n{writer.get_extra_info('peername')}")
         raise TypeError("Only RSA public keys are supported for encryption.")
 
     # Encrypt AES key with client's RSA public key
@@ -335,7 +345,7 @@ async def establish_secure_channel_and_get_aes_key(reader, writer):
 async def receive_loop(client:Client):
     while True:
         message = await client.receive_secure_message()
-        logger.info(f"Received message: {message}\t[{client.username}],[{client.ipaddress}]: ")
+        logger.debug(f"Received message: '{message}'\tfrom user with username: '{client.username}', and IP address : '{client.ipaddress}', in room: '{client.current_room.code}'")
         client_room = client.current_room
         if message.startswith('/'):
             await handle_command(client,message)
@@ -456,6 +466,7 @@ commands = {
 #Commands end here
 
 async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : asyncio.StreamWriter, aes_key: bytes, max_delay_sec=5) -> str:
+    addr, cliport = writer.get_extra_info('peername')
     data = await reader.readline()
     if not data:
         raise ConnectionError("Connection closed by peer.")
@@ -473,7 +484,7 @@ async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : 
 
     current_time = int(time.time())
     if abs(current_time - timestamp) > max_delay_sec:
-        logger.warning(f"Received message with wrong timestamp: {data.decode()}, Sender IP address: {writer.get_extra_info('peername')}")
+        logger.warning(f"Received message with timestamp earlier or later than {max_delay_sec} of current time: '{data.decode()}', Sender IP address: '{addr}'")
         raise ValueError("Bad Message Timestamp")
     
     data_to_auth = (
@@ -486,7 +497,7 @@ async def receive_secure_message_and_log(reader: asyncio.StreamReader, writer : 
     expected_hmac = hmac.new(aes_key, data_to_auth, hashlib.sha256).digest()
 
     if not hmac.compare_digest(received_hmac, expected_hmac):
-        logger.warning(f"HMAC authentication of message: {data.decode()} failed. Sender IP address: {writer.get_extra_info('peername')}")
+        logger.warning(f"HMAC authentication of message: '{data.decode()}' failed. Sender IP address: '{addr}'")
         raise ValueError("HMAC authentication failed.")
 
     cipher = Cipher(algorithms.AES(aes_key), modes.GCM(nonce_bytes, tag_bytes))
@@ -538,7 +549,8 @@ async def log_nonce(nonce_bytes: bytes, writer: asyncio.StreamWriter):
     async with nonce_lock:
 
         if new_nonce_hex in nonce_dict:
-            logger.warning(f"Replay attack detected from {writer.get_extra_info('peername')} with nonce: {nonce_bytes}")
+            addr, cliport = writer.get_extra_info('peername')
+            logger.warning(f"Replay attack detected from '{addr}' with nonce: '{nonce_bytes}'")
             raise ValueError("Bad Nonce")
 
         current_time = int(time.time())
@@ -568,7 +580,7 @@ async def main():
         rooms.append(main_menu)
 
     server = await asyncio.start_server(handle_client, host, port)
-    logger.info(f'Server started listening on {host}:{port}')
+    logger.info(f"Server started listening on '{host}':'{port}'")
     async with server:
         await server.serve_forever()
 
