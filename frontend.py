@@ -3,6 +3,7 @@ import sys
 import os
 import curses
 import traceback
+import time
 
 #RECEIVE_WINDOW_PARAMS
 r_begin_x = 1
@@ -16,6 +17,13 @@ i_begin_y = 32
 i_height = 3
 i_width = 200
 
+
+BACK_END_IP = '127.0.0.1'
+BACK_END_PORT = 33445
+
+disconnected_from_backend = False
+
+CONNECTION_TIMEOUT_MAX_SECONDS = 10
 
 class NonBlockingInput:
     def __init__(self, inputwin, backendwriter):
@@ -68,35 +76,44 @@ class OutputReceived:
             self.receivewin.addstr(curY, 1, message)
             curY +=1 
     
-server_task = None
-server_is_closed = False
 
 async def main():
-    server = await asyncio.start_server(handle_comms, '127.0.0.1' , 33445)
-    #script_path = os.path.join(os.path.dirname(__file__), 'client.py')
-    #print("Starting backend process...")
-    #backend_proc = await asyncio.create_subprocess_exec(
-    #    sys.executable, script_path,
-    #    stdout=asyncio.subprocess.PIPE,
-    #    stderr=asyncio.subprocess.PIPE
-    #)
-    global server_task
-    server_task = asyncio.create_task(server.serve_forever())
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
+    script_path = os.path.join(os.path.dirname(__file__), 'client.py')
+    print(script_path)
+    print("Starting backend process...")
+    backend_proc = await asyncio.create_subprocess_exec(
+        sys.executable, script_path
+    )
+    start_time = int(time.time())
+    connection_successful = False
+    backend_reader: asyncio.StreamReader = None
+    backend_writer: asyncio.StreamWriter = None
+    while int(time.time()) - start_time <= CONNECTION_TIMEOUT_MAX_SECONDS:
+        try:
+            backend_reader, backend_writer = await asyncio.open_connection(BACK_END_IP, BACK_END_PORT)
+            connection_successful = True
+            break
+        except ConnectionRefusedError:
+            pass
+        await asyncio.sleep(0.5)
+    if connection_successful:
+        await handle_comms(backend_reader, backend_writer)
+    else:
+        raise ConnectionRefusedError("Connection timed out while trying to connect to client backend")
 
 async def handle_comms(reader, writer):
     stdscr = None
     try:
-        serverip = input("Enter server ip: ")
-        port = input("Enter server port: ")
-
+        data = await reader.readline()
+        input_msg = data.decode().strip()
+        serverip = input(input_msg)
         writer.write((serverip + '\n').encode())
         await writer.drain()
-
-        writer.write((port + '\n').encode())
+        
+        data = await reader.readline()
+        input_msg = data.decode().strip()
+        serverport = input(input_msg)
+        writer.write((serverport + '\n').encode())
         await writer.drain()
 
         stdscr = curses.initscr()
@@ -111,16 +128,14 @@ async def handle_comms(reader, writer):
                 send_loop(inputwin, writer)
         )
     except BaseException:
-        global server_is_closed
-        server_is_closed = True
+        global disconnected_from_backend
+        disconnected_from_backend = True
         if stdscr is not None:
             stdscr.clear()
             stdscr.refresh()
             stdscr.move(0,0)
             curses.endwin()
         traceback.print_exc()
-        if server_task is not None:
-            server_task.cancel()
     finally:
         writer.close()
         await writer.wait_closed()
@@ -128,11 +143,11 @@ async def handle_comms(reader, writer):
 async def receive_loop(backendreader, receivewin):
     outrecv = OutputReceived(receivewin)
     while True:
-        if server_is_closed:
+        if disconnected_from_backend:
             break
         data = await backendreader.readline()
         if not data:
-            raise ConnectionError("back end disconnected")
+            raise ConnectionError("Back end disconnected")
         message = data.decode().strip()
         outrecv.add_message(message)
 
@@ -144,7 +159,7 @@ async def send_msg(backendwriter, msg):
 async def send_loop(inputwin, backendwriter):
     nbi = NonBlockingInput(inputwin, backendwriter)
     while True:
-        if server_is_closed:
+        if disconnected_from_backend:
             break
         await nbi.build_input()
         await asyncio.sleep(0.05)
