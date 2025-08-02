@@ -13,7 +13,6 @@ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
 from cryptography.hazmat.primitives import serialization, hashes
 
 import logging
-import logging.config
 
 logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)
@@ -38,8 +37,8 @@ logger.addHandler(fileHandler2)
 logger.addHandler(consoleHandler)
 
 
-host = '127.0.0.1'
-port = 4444
+HOST_IP = '127.0.0.1'
+HOST_PORT = 4444
 client_list = []
 client_list_lock = asyncio.Lock()
 rooms = []
@@ -49,8 +48,6 @@ nonce_dict = {}
 nonce_lock = asyncio.Lock()
 
 MAIN_MENU_CODE = '#00000000'
-
-
 
 
 class Client:
@@ -270,7 +267,7 @@ async def start_authentication_sequence(reader, writer, aes_key):
     password = await receive_secure_message_and_log(reader, writer, aes_key)
     password = password.strip()
     count = 1
-    while not (username == "usertest" and password == "password"):
+    while not ((username == "usertest" and password == "password") or (username == "ba2han" and password == "mypass")):
         logger.warning(f"Received wrong username:password pair '{username}:{password}'. Sender IP:'{addr}'")
         msg = "Server: Wrong Credentials, try again.\nServer: Enter username"
         secure_msg = construct_secure_message(aes_key, msg)
@@ -579,8 +576,8 @@ async def main():
     async with rooms_lock: #not sure if needed
         rooms.append(main_menu)
 
-    server = await asyncio.start_server(handle_client, host, port)
-    logger.info(f"Server started listening on '{host}':'{port}'")
+    server = await asyncio.start_server(handle_client, HOST_IP, HOST_PORT)
+    logger.info(f"Server started listening on '{HOST_IP}':'{HOST_PORT}'")
     async with server:
         await server.serve_forever()
 
