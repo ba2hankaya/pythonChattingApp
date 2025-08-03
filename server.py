@@ -92,6 +92,8 @@ class Client:
                 await self.switch_room(room)
                 message = f"Server: You have successfully entered the room {room.code}."
                 await self.send_secure_message(message)
+                message = f"Server: User 'self.username' has joined the room."
+                await room.broadcast_message(message)
             else:
                 message = "Server: Wrong password."
                 await self.send_secure_message(message)
@@ -99,6 +101,8 @@ class Client:
             await self.switch_room(room)
             message = f"Server: You have successfully entered the room {room.code}."
             await self.send_secure_message(message)
+            message = f"Server: User 'self.username' has joined the room."
+            await room.broadcast_message(message)
     async def create_room(self, room_code:str):
         async with rooms_lock:
             for room in rooms:
@@ -117,11 +121,15 @@ class Client:
         received = await self.receive_secure_message()
         logger.debug(f"Sent client '{self.username}' with IP Address '{self.ipaddress}' prompt: '{message}' and received back: '{received}'")
         return received
-    async def exit_room(self):
-        await self.join(rooms[0]) #main menu
+    async def forcefully_remove_from_current_room(self):
+        await self.join(rooms[0])#main menu
         message = "Server: You are in the main menu now."
         await self.send_secure_message(message)
-
+    async def leave_room(self):
+        await self.current_room.broadcast_message(f"Server: User '{self.username}' has left the room({self.current_room.code}).")
+        await self.join(rooms[0])#main menu
+        message = "Server: You are in the main menu now."
+        await self.send_secure_message(message)
 
 
 class Room:
@@ -130,7 +138,7 @@ class Room:
         self.code = code
         self.password = None
         self.members = []
-        self.banned_members = []
+        self.banned_members_usernames = []
         self.lock = asyncio.Lock()
     async def set_password(self, attempter:Client):
         async with self.lock:
@@ -193,6 +201,8 @@ class Room:
                 message = f"You have been kicked from the room {self.code}. Sending you to main menu now..."
                 await cl.send_secure_message(message)
                 await cl.exit_room()
+                message = f"User '{to_be_kicked_username}' has been kicked from this room({self.code})."
+                await self.broadcast_message(message)
                 break
     async def kick_all_users_except_owner(self):
         async with self.lock:
@@ -202,20 +212,23 @@ class Room:
                 message = f"You have been kicked from the room {self.code}. Sending you to main menu now..."
                 await cl.send_secure_message(message)
                 await cl.exit_room()
+                message = f"User '{cl.username}' has been kicked from this room({self.code})."
+                await self.broadcast_message(message)
+                break
     async def ban_user_with_username(self, to_be_banned_username:str):
         async with self.lock:
-            self.banned_members.append(to_be_banned_username)
+            self.banned_members_usernames.append(to_be_banned_username)
             members_copy = self.members[:]
         for cl in members_copy:
             if cl.username == to_be_banned_username:
                 message = f"Server: You have banned from room {self.code} by {self.owner_name}."
                 await cl.send_secure_message(message)
                 await cl.exit_room()
-            else:
-                await cl.send_secure_message(f"Server: {to_be_banned_username} has been banned from this room({self.code}).")
+                await self.broadcast_message(f"Server: {to_be_banned_username} has been banned from this room({self.code}).")
+                break
     async def has_banned_user_with_username(self, username:str):
         async with self.lock:
-            return username in self.banned_members
+            return username in self.banned_members_usernames
 
 async def handle_client(reader, writer):
     addr, cliport = writer.get_extra_info('peername')
@@ -347,7 +360,7 @@ async def receive_loop(client:Client):
         if message.startswith('/'):
             await handle_command(client,message)
         else:
-            message = f"{client.username}: {message}"
+            message = f"{client.username}({client_room.code}): {message}"
             if not client_room.code == MAIN_MENU_CODE:
                 await client_room.broadcast_message(message)
             else:
@@ -389,8 +402,8 @@ async def send_help_message_cmd(client:Client):
     To receive this help message use the \'/help\' command.\""""
     await client.send_secure_message(message)
 
-async def exit_room_cmd(client:Client):
-    await client.exit_room()
+async def leave_room_cmd(client:Client):
+    await client.leave_room()
 
 MAX_ROOMS_PER_CLIENT = 3
 async def join_room_cmd(client:Client, room_code):
@@ -454,7 +467,7 @@ commands = {
     "help":(send_help_message_cmd, 0),
     "join":(join_room_cmd, 1),
     "setpasswd":(set_room_password_cmd, 0),
-    "exitroom":(exit_room_cmd, 0),
+    "exit":(leave_room_cmd, 0),
     "kickall":(kick_all_users_except_owner_cmd, 0),
     "kick":(kick_user_with_username_cmd, 1),
     "ban":(ban_user_with_username_cmd, 1)
