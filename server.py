@@ -5,6 +5,8 @@ import base64
 import hmac
 import hashlib
 import traceback
+import weakref
+import gc
 from message import Message
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -92,7 +94,7 @@ class Client:
                 await self.switch_room(room)
                 message = f"Server: You have successfully entered the room {room.code}."
                 await self.send_secure_message(message)
-                message = f"Server: User 'self.username' has joined the room."
+                message = f"Server: User '{self.username}' has joined the room."
                 await room.broadcast_message(message)
             else:
                 message = "Server: Wrong password."
@@ -101,7 +103,7 @@ class Client:
             await self.switch_room(room)
             message = f"Server: You have successfully entered the room {room.code}."
             await self.send_secure_message(message)
-            message = f"Server: User 'self.username' has joined the room."
+            message = f"Server: User '{self.username}' has joined the room."
             await room.broadcast_message(message)
     async def create_room(self, room_code:str):
         async with rooms_lock:
@@ -121,7 +123,7 @@ class Client:
         received = await self.receive_secure_message()
         logger.debug(f"Sent client '{self.username}' with IP Address '{self.ipaddress}' prompt: '{message}' and received back: '{received}'")
         return received
-    async def forcefully_remove_from_current_room(self):
+    async def forcefully_send_to_main_menu(self):
         await self.join(rooms[0])#main menu
         message = "Server: You are in the main menu now."
         await self.send_secure_message(message)
@@ -176,7 +178,7 @@ class Room:
     async def is_correct_password(self, password):
         async with self.lock:
             return password == self.password
-    async def is_owner(self, client_username:str):
+    async def is_owned_by_user_with_username(self, client_username:str):
         async with self.lock:
             return client_username == self.owner_name
     async def add_member(self, client:Client):
@@ -188,6 +190,13 @@ class Room:
     async def client_is_in_room(self, client:Client):
         async with self.lock:
             return client in self.members
+    async def list_members_to_client(self, client:Client):
+        async with self.lock:
+            members_copy = self.members[:]
+        message = ""
+        for cl in members_copy:
+            message += cl.username + '\n'
+        await client.send_secure_message(message)
     async def broadcast_message(self, message:str):
         async with self.lock:
             members_copy = self.members[:]
@@ -200,7 +209,7 @@ class Room:
             if cl.username == to_be_kicked_username:
                 message = f"You have been kicked from the room {self.code}. Sending you to main menu now..."
                 await cl.send_secure_message(message)
-                await cl.exit_room()
+                await cl.forcefully_send_to_main_menu()
                 message = f"User '{to_be_kicked_username}' has been kicked from this room({self.code})."
                 await self.broadcast_message(message)
                 break
@@ -211,7 +220,7 @@ class Room:
             if cl.username != self.owner_name:
                 message = f"You have been kicked from the room {self.code}. Sending you to main menu now..."
                 await cl.send_secure_message(message)
-                await cl.exit_room()
+                await cl.forcefully_send_to_main_menu()
                 message = f"User '{cl.username}' has been kicked from this room({self.code})."
                 await self.broadcast_message(message)
                 break
@@ -223,12 +232,25 @@ class Room:
             if cl.username == to_be_banned_username:
                 message = f"Server: You have banned from room {self.code} by {self.owner_name}."
                 await cl.send_secure_message(message)
-                await cl.exit_room()
-                await self.broadcast_message(f"Server: {to_be_banned_username} has been banned from this room({self.code}).")
+                await cl.forcefully_send_to_main_menu()
                 break
+        await self.broadcast_message(f"Server: {to_be_banned_username} has been banned from this room({self.code}).")
     async def has_banned_user_with_username(self, username:str):
         async with self.lock:
             return username in self.banned_members_usernames
+    async def unban_user_with_username(self, username:str):
+        async with self.lock:
+            if username in self.banned_members_usernames:
+                self.banned_members_usernames.remove(username)
+                await self.broadcast_message(f"Server: {username} has been unbanned from this room({self.code}).")
+            else:
+                logger.error("User with username: {username} was tried to be unbanned from this room: {self.code}, reaching this message shouldn't be possible")
+    async def close(self):
+        async with rooms_lock:
+            rooms.remove(self)
+        await self.kick_all_users_except_owner()
+        await self.kick_user_with_username(self.owner_name)
+
 
 async def handle_client(reader, writer):
     addr, cliport = writer.get_extra_info('peername')
@@ -382,8 +404,11 @@ async def handle_command(client: Client, message: str):
     if len(args) < min_arg_count:
         await client.send_secure_message("Server: Invalid use of the command. /help for help")
         return
-    await func(client, *args[:min_arg_count])
-
+    if cmd == "message": ##very very bad solution, fix this asap
+        msg = message[len(parts[0])+len(parts[1])+3:]
+        await func(client, *args[:min_arg_count], msg)
+    else:
+        await func(client, *args[:min_arg_count])
 
 #Commands start here
 
@@ -431,7 +456,7 @@ async def set_room_password_cmd(client:Client):
 
 async def kick_all_users_except_owner_cmd(client:Client):
     r = client.current_room
-    if not await r.is_owner(client.username):
+    if not await r.is_owned_by_user_with_username(client.username):
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
         return
@@ -439,7 +464,7 @@ async def kick_all_users_except_owner_cmd(client:Client):
 
 async def kick_user_with_username_cmd(client:Client, to_be_kicked_username:str):
     r = client.current_room
-    if not await r.is_owner(client.username):
+    if not await r.is_owned_by_user_with_username(client.username):
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
         return
@@ -451,7 +476,7 @@ async def kick_user_with_username_cmd(client:Client, to_be_kicked_username:str):
 
 async def ban_user_with_username_cmd(client:Client, to_ban_username:str):
     r = client.current_room
-    if not await r.is_owner(client.username): 
+    if not await r.is_owned_by_user_with_username(client.username): 
         message = f"Server: You can't do that in the current room."
         await client.send_secure_message(message)
         return
@@ -461,16 +486,54 @@ async def ban_user_with_username_cmd(client:Client, to_ban_username:str):
         return
     await r.ban_user_with_username(to_ban_username)
 
+async def unban_user_with_username_cmd(client:Client, to_unban_username:str):
+    r = client.current_room
+    if await r.has_banned_user_with_username(to_unban_username):
+        await r.unban_user_with_username(to_unban_username)
+    else:
+        message = f"There is no user with username '{to_unban_username}' that has been banned in this room."
+        await client.send_secure_message(message)
+
+async def list_members_cmd(client:Client):
+    r = client.current_room
+    await r.list_members_to_client(client)
+
+async def send_direct_message_from_client_to_client_username_cmd(sender:Client, receiver_username:Client, message_from_sender:str):
+    receiver_client = None
+    async with client_list_lock:
+        for client in client_list:
+            if receiver_username == client.username:
+                receiver_client = client
+    if receiver_client is None:
+        message = f"Server: No user with username '{receiver_username}' was found in the server."
+        await sender.send_secure_message(message)
+        return
+    await receiver_client.send_secure_message(f"Direct messsage from {sender.username}: {message_from_sender}")
+    await sender.send_secure_message(f"Sent to {receiver_username}: {message_from_sender}")
+
+async def close_room_cmd(client:Client):
+    client_room = client.current_room
+    if not await client_room.is_owned_by_user_with_username(client.username):
+        message = f"Server: You can't close a room you don't own."
+        await client.send_secure_message(message)
+        return
+    await client_room.close()
+        
+
 commands = {
     #"{command_name}":(func_name, num_of_args)
-    "list":(list_rooms_cmd, 0),
+    "listrooms":(list_rooms_cmd, 0),
     "help":(send_help_message_cmd, 0),
     "join":(join_room_cmd, 1),
     "setpasswd":(set_room_password_cmd, 0),
     "exit":(leave_room_cmd, 0),
+    "listmembers":(list_members_cmd, 0),
     "kickall":(kick_all_users_except_owner_cmd, 0),
+    "closeroom":(close_room_cmd, 0),
     "kick":(kick_user_with_username_cmd, 1),
-    "ban":(ban_user_with_username_cmd, 1)
+    "ban":(ban_user_with_username_cmd, 1),
+    "unban":(unban_user_with_username_cmd, 1),
+    "message":(send_direct_message_from_client_to_client_username_cmd, 1) 
 }
 
 #Commands end here
